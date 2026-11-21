@@ -24,6 +24,9 @@ Voix de secours Piper (une fois) :
     wget https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx
     wget https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json
 
+Navigateur web piloté (une fois) :
+    ./venv/bin/pip install playwright beautifulsoup4 && ./venv/bin/playwright install chromium
+
 Reconnaissance de ta voix + interruption (une fois) :
     ./venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
     ./venv/bin/pip install numpy scipy librosa webrtcvad-wheels
@@ -350,7 +353,9 @@ def _espeak(texte):
 def _decouper(texte):
     """Nettoie le texte et le coupe en 2 : 1re phrase (courte, donc rapide à générer) + le reste."""
     texte = re.sub(r"https?://\S+", "le lien", texte)
+    texte = re.sub(r"\[(\d+|réf\. nécessaire|note \d+|[a-z])\]", "", texte)    # renvois de notes [2]
     texte = re.sub(r"[*_#`>~|]", "", texte)
+    texte = re.sub("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]", "", texte)   # les émojis ne se lisent pas
     texte = re.sub(r"\s+", " ", texte).strip()
     morceaux = re.split(r"(?<=[.!?…])\s+", texte, maxsplit=1)
     return [m for m in morceaux if m.strip()]
@@ -1466,6 +1471,786 @@ def quitter_jarvis() -> str:
     return "Jarvis va s'arrêter juste après cette réponse : dis au revoir en une phrase courte."
 
 
+# ============================ NAVIGATEUR WEB ================================
+# Jarvis pilote un vrai navigateur Chromium VISIBLE (Playwright) : tu le vois ouvrir les pages,
+# défiler, cliquer et taper. Le profil est gardé : tes connexions aux sites restent ouvertes.
+#   Installation (une fois) : ./venv/bin/pip install playwright beautifulsoup4
+#                             ./venv/bin/playwright install chromium
+PROFIL_WEB = os.path.expanduser("~/.config/jarvis-navigateur")
+DOSSIER_DONNEES = os.path.expanduser("~/Jarvis_donnees")      # où vont les données récoltées
+_WEB = {"pw": None, "ctx": None, "page": None, "exec": None}
+
+_JS_TEXTE_VISIBLE = r"""() => {
+  const H = innerHeight, blocs = [], cache = new Map();
+  const bloc = el => {            // bloc parent (paragraphe, titre, cellule...) : on y recolle les morceaux
+    let e = el;
+    while (e && e !== document.body) {
+      if (!cache.has(e)) cache.set(e, !getComputedStyle(e).display.startsWith('inline'));
+      if (cache.get(e)) return e;
+      e = e.parentElement;
+    }
+    return document.body;
+  };
+  const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n, dernier = null;
+  while ((n = w.nextNode())) {
+    const t = n.textContent.replace(/\s+/g, ' ').trim();
+    const el = n.parentElement;
+    if (!t || !el || ['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(el.tagName)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > H || r.width === 0 || r.height === 0) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none') continue;
+    const b = bloc(el);
+    if (b === dernier && blocs.length) blocs[blocs.length - 1] += ' ' + t;
+    else blocs.push(t);
+    dernier = b;
+  }
+  return blocs.join('\n').replace(/ ([,.;:!?)])/g, '$1');
+}"""
+_JS_POSITION = "() => [Math.round(scrollY), Math.max(document.body.scrollHeight, document.documentElement.scrollHeight), innerHeight]"
+
+
+def _web(fn, delai=120):
+    """Playwright n'aime pas changer de thread : tout passe par un seul thread dédié."""
+    import concurrent.futures
+    if _WEB["exec"] is None:
+        _WEB["exec"] = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="web")
+    try:
+        return _WEB["exec"].submit(fn).result(timeout=delai)
+    except ModuleNotFoundError:
+        return ("Le module navigateur n'est pas installé : ./venv/bin/pip install playwright beautifulsoup4 "
+                "puis ./venv/bin/playwright install chromium")
+    except concurrent.futures.TimeoutError:
+        return "Le navigateur met trop de temps à répondre."
+    except Exception as e:
+        return f"Erreur navigateur : {type(e).__name__}: {str(e)[:300]}"
+
+
+def _page():
+    """La page active du navigateur de Jarvis (le lance si besoin, ou le relance si tu l'as fermé)."""
+    ctx = _WEB["ctx"]
+    if ctx is not None:
+        try:
+            pages = [p for p in ctx.pages if not p.is_closed()]
+            if pages:
+                if _WEB["page"] not in pages:
+                    _WEB["page"] = pages[-1]
+                return _WEB["page"]
+        except Exception:
+            pass
+        try:
+            ctx.close()
+        except Exception:
+            pass
+        _WEB["ctx"] = None
+    if _WEB["pw"] is None:
+        from playwright.sync_api import sync_playwright
+        _WEB["pw"] = sync_playwright().start()
+    ctx = _WEB["pw"].chromium.launch_persistent_context(
+        PROFIL_WEB, headless=False, no_viewport=True, locale="fr-FR",
+        args=["--start-maximized", "--disable-blink-features=AutomationControlled"])
+    ctx.on("page", lambda p: _WEB.__setitem__("page", p))      # nouvel onglet ouvert par un lien
+    _WEB["ctx"] = ctx
+    _WEB["page"] = ctx.pages[0] if ctx.pages else ctx.new_page()
+    return _WEB["page"]
+
+
+def _attendre_page(page):
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=4000)
+    except Exception:
+        pass
+
+
+def _texte_visible(page, limite=5000):
+    try:
+        t = page.evaluate(_JS_TEXTE_VISIBLE)
+    except Exception:
+        t = ""
+    return t[:limite] + ("\n[...]" if len(t) > limite else "")
+
+
+def _etat_page(page, avec_texte=True):
+    try:
+        y, h, vh = page.evaluate(_JS_POSITION)
+        pos = f"position {min(100, round(100 * (y + vh) / max(h, 1)))} % de la page"
+    except Exception:
+        pos = ""
+    s = f"Page : {page.title()[:120]} | {page.url[:200]} | {pos}"
+    return s + ("\nTexte visible à l'écran :\n" + _texte_visible(page) if avec_texte else "")
+
+
+def _surligner(loc):
+    """Entoure en rouge l'élément sur lequel Jarvis va agir : tu vois ce qu'il fait."""
+    try:
+        loc.scroll_into_view_if_needed(timeout=3000)
+        loc.evaluate("e => { e.style.outline = '3px solid #e53935'; e.style.outlineOffset = '2px'; "
+                     "setTimeout(() => { e.style.outline = ''; }, 1500); }")
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+
+def web_ouvrir(adresse: str) -> str:
+    """Ouvre une page web dans le navigateur VISIBLE de Jarvis (adresse, ou des mots à chercher sur Google).
+    Renvoie le titre et le texte visible. Ensuite : web_defiler, web_lire, web_cliquer, web_taper..."""
+    def f():
+        page = _page()
+        a = adresse.strip()
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", a):
+            url = a
+        elif re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", a):
+            url = "https://" + a
+        else:
+            import urllib.parse
+            url = "https://www.google.com/search?hl=fr&q=" + urllib.parse.quote(a)
+        page.bring_to_front()
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        _attendre_page(page)
+        return _etat_page(page)
+    return _web(f)
+
+
+def web_defiler(direction: str = "bas", ecrans: float = 1.0) -> str:
+    """Fait défiler la page sous les yeux de l'utilisateur et renvoie le texte maintenant visible
+    (pour lire une page petit à petit). direction : "bas", "haut", "debut" ou "fin"."""
+    def f():
+        page = _page()
+        d = direction.lower()
+        if "deb" in d or "déb" in d or "top" in d:
+            page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
+        elif "fin" in d or "bottom" in d:
+            page.evaluate("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})")
+        else:
+            signe = -1 if "haut" in d or "up" in d or "monte" in d else 1
+            page.evaluate(f"window.scrollBy({{top: {signe} * innerHeight * 0.85 * {float(ecrans)}, behavior: 'smooth'}})")
+        time.sleep(0.9)
+        return _etat_page(page)
+    return _web(f)
+
+
+def web_lire(tout: bool = False) -> str:
+    """Lit la page web ouverte. tout=False : seulement ce qui est à l'écran ; tout=True : la page entière
+    (jusqu'à 15000 caractères), pour résumer ou chercher une information."""
+    def f():
+        page = _page()
+        if not tout:
+            return _etat_page(page)
+        texte = page.inner_text("body", timeout=10000)
+        texte = re.sub(r"\n\s*\n+", "\n", texte)
+        return _etat_page(page, False) + "\n" + texte[:15000] + ("\n[... page tronquée]" if len(texte) > 15000 else "")
+    return _web(f)
+
+
+def _trouver(page, texte, champ=False):
+    """Cherche un élément par son texte, son étiquette, son placeholder... (le 1er visible)."""
+    if champ:
+        essais = [lambda: page.get_by_label(texte), lambda: page.get_by_placeholder(texte),
+                  lambda: page.get_by_role("searchbox", name=texte), lambda: page.get_by_role("textbox", name=texte),
+                  lambda: page.get_by_role("combobox", name=texte),
+                  lambda: page.locator(f'input[name*="{texte}" i], textarea[name*="{texte}" i], '
+                                       f'input[id*="{texte}" i], textarea[id*="{texte}" i]')]
+    else:
+        essais = [lambda: page.get_by_role("button", name=texte), lambda: page.get_by_role("link", name=texte),
+                  lambda: page.get_by_role("tab", name=texte), lambda: page.get_by_role("menuitem", name=texte),
+                  lambda: page.get_by_label(texte), lambda: page.get_by_text(texte, exact=True),
+                  lambda: page.get_by_text(texte), lambda: page.get_by_title(texte),
+                  lambda: page.get_by_alt_text(texte)]
+    for essai in essais:
+        try:
+            loc = essai()
+            for i in range(min(loc.count(), 10)):
+                el = loc.nth(i)
+                if el.is_visible():
+                    return el
+        except Exception:
+            continue
+    return None
+
+
+def web_cliquer(texte: str) -> str:
+    """Clique sur un lien, un bouton, un onglet... de la page web, désigné par le texte qu'on voit dessus
+    (ou son étiquette). L'élément est entouré en rouge avant le clic."""
+    def f():
+        page = _page()
+        loc = _trouver(page, texte)
+        if loc is None:
+            return f"Je ne trouve rien de cliquable avec le texte « {texte} » à l'écran. Défile ou lis la page."
+        _surligner(loc)
+        loc.click(timeout=8000)
+        time.sleep(0.5)
+        page = _page()
+        _attendre_page(page)
+        return "Cliqué. " + _etat_page(page)
+    return _web(f)
+
+
+def web_taper(texte: str, champ: str = "", valider: bool = False) -> str:
+    """Tape du texte dans un champ de la page web (recherche, formulaire, connexion, message...).
+    champ = étiquette ou placeholder du champ (« Rechercher », « E-mail », « Nom »...) ; vide = le champ
+    actif ou le premier champ de saisie visible. valider=True appuie sur Entrée après."""
+    def f():
+        page = _page()
+        loc = _trouver(page, champ, champ=True) if champ else None
+        if loc is None and not champ:
+            actif = page.evaluate("() => { const e = document.activeElement; return !!e && "
+                                  "(['INPUT','TEXTAREA'].includes(e.tagName) || e.isContentEditable); }")
+            if not actif:
+                cand = page.locator('input[type="search"], input[type="text"], input[type="email"], '
+                                    'input:not([type]), textarea, [contenteditable="true"]')
+                for i in range(min(cand.count(), 20)):
+                    if cand.nth(i).is_visible():
+                        loc = cand.nth(i)
+                        break
+        if champ and loc is None:
+            bouton = _trouver(page, champ)               # ex : loupe « Rechercher » qui ouvre le champ
+            if bouton is not None:
+                _surligner(bouton)
+                bouton.click(timeout=5000)
+                time.sleep(0.6)
+                loc = _trouver(page, champ, champ=True)
+                if loc is None and page.evaluate("() => ['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)"):
+                    loc = page.locator(":focus")
+        if champ and loc is None:
+            return f"Je ne trouve pas de champ « {champ} » à l'écran."
+        if loc is not None:
+            _surligner(loc)
+            loc.click(timeout=8000)
+            loc.fill("")
+        page.keyboard.type(texte, delay=35)          # tapé lettre par lettre : l'utilisateur le voit
+        if valider:
+            page.keyboard.press("Enter")
+            time.sleep(0.8)
+            page = _page()
+            _attendre_page(page)
+        return "Texte tapé. " + _etat_page(page)
+    return _web(f)
+
+
+def web_touche(touche: str) -> str:
+    """Appuie sur une touche dans le navigateur : Enter, Escape, Tab, PageDown, ArrowDown, Control+a..."""
+    def f():
+        page = _page()
+        page.keyboard.press(touche)
+        time.sleep(0.5)
+        return _etat_page(page)
+    return _web(f)
+
+
+def web_retour() -> str:
+    """Revient à la page web précédente (bouton Précédent)."""
+    def f():
+        page = _page()
+        page.go_back(wait_until="domcontentloaded", timeout=20000)
+        _attendre_page(page)
+        return _etat_page(page)
+    return _web(f)
+
+
+def web_liens(filtre: str = "") -> str:
+    """Liste les liens de la page web ouverte (texte et adresse). filtre = mot à chercher dans les liens."""
+    def f():
+        page = _page()
+        liens = page.evaluate("() => [...document.querySelectorAll('a[href]')].map(a => "
+                              "[a.innerText.replace(/\\s+/g,' ').trim(), a.href]).filter(x => x[0] || x[1])")
+        filt = filtre.lower()
+        lignes, vus = [], set()
+        for t, h in liens:
+            if (filt and filt not in t.lower() and filt not in h.lower()) or h in vus:
+                continue
+            vus.add(h)
+            lignes.append(f"- {t[:80] or '(sans texte)'} -> {h[:150]}")
+        return f"{len(lignes)} liens :\n" + "\n".join(lignes[:120])
+    return _web(f)
+
+
+def web_fermer() -> str:
+    """Ferme le navigateur de Jarvis."""
+    def f():
+        if _WEB["ctx"] is None:
+            return "Le navigateur de Jarvis n'était pas ouvert."
+        try:
+            _WEB["ctx"].close()
+        finally:
+            _WEB["ctx"], _WEB["page"] = None, None
+        return "Navigateur fermé."
+    return _web(f)
+
+
+# ------------------------ Lecture à voix haute en défilant ------------------
+_JS_BLOCS = r"""(depuisDebut) => {
+  const racine = document.querySelector('article, main, [role=main], #content, #mw-content-text') || document.body;
+  const exclus = 'nav, footer, aside, header, [role=navigation], [role=banner], [role=contentinfo], .navbox, .infobox, .reference, .mw-editsection';
+  const els = [...racine.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, dd, figcaption')];
+  const out = [];
+  els.forEach(e => {
+    if (e.closest(exclus)) return;
+    if (e.tagName === 'LI' && e.querySelector('p, li')) return;
+    const t = e.innerText.replace(/\s+/g, ' ').trim();
+    const titre = /^H\d$/.test(e.tagName);
+    if (!t || (!titre && t.length < 40)) return;
+    const r = e.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
+    if (!depuisDebut && r.bottom < 0) return;
+    e.setAttribute('data-jarvis-bloc', out.length);
+    out.push(t);
+  });
+  return out;
+}"""
+
+
+def web_lire_a_voix_haute(depuis_debut: bool = False, blocs_max: int = 30) -> str:
+    """Lit À VOIX HAUTE le contenu de la page web ouverte en la faisant défiler automatiquement, petit à
+    petit, sous les yeux de l'utilisateur (le passage lu est surligné). Commence à l'endroit affiché
+    (ou au début si depuis_debut=True). L'utilisateur peut l'interrompre en parlant.
+    Après cet outil, réponds juste une phrase très courte (le texte a déjà été lu)."""
+    blocs = _web(lambda: _page().evaluate(_JS_BLOCS, bool(depuis_debut)))
+    if isinstance(blocs, str):
+        return blocs
+    if not blocs:
+        return "Je ne trouve pas de texte à lire sur cette page."
+    # on regroupe les petits blocs (environ 450 caractères) pour une lecture fluide
+    groupes, courant = [], []
+    for i, t in enumerate(blocs[:max(1, int(blocs_max))]):
+        courant.append((i, t))
+        if sum(len(x) for _, x in courant) > 450 or re.match(r"^\S", t) and len(t) < 80 and len(courant) > 1:
+            groupes.append(courant)
+            courant = []
+    if courant:
+        groupes.append(courant)
+    lus = 0
+    for g in groupes:
+        premier = g[0][0]
+
+        def montrer(i=premier, n=len(g)):
+            page = _page()
+            page.evaluate("([i, n]) => { document.querySelectorAll('[data-jarvis-lu]').forEach(e => {"
+                          "e.style.background = ''; e.removeAttribute('data-jarvis-lu'); });"
+                          "for (let k = i; k < i + n; k++) { const e = document.querySelector(`[data-jarvis-bloc=\"${k}\"]`);"
+                          "if (!e) continue; if (k === i) e.scrollIntoView({behavior: 'smooth', block: 'center'});"
+                          "e.style.background = 'rgba(255, 235, 59, .35)'; e.setAttribute('data-jarvis-lu', 1); } }",
+                          [i, n])
+        _web(montrer)
+        parler(" ".join(t for _, t in g))
+        lus += len(g)
+        if _INTERROMPU["oui"]:
+            return (f"L'utilisateur m'a interrompu pendant la lecture (après {lus} passages). "
+                    "N'ajoute rien : il va te dire ce qu'il veut.")
+    reste = len(blocs) - lus
+    return (f"Lecture faite ({lus} passages lus à voix haute). " +
+            (f"Il reste {reste} passages : propose de continuer." if reste > 0 else "Fin de la page atteinte."))
+
+
+# ----------------------- Demander une info à l'utilisateur ------------------
+def demander_utilisateur(question: str) -> str:
+    """Pose une question à voix haute à l'utilisateur et renvoie sa réponse, SANS arrêter la tâche en cours.
+    Sert pendant une démarche : informations pour remplir un formulaire, code de vérification reçu par
+    SMS ou e-mail, choix à faire, validation d'un message avant de l'envoyer, captcha à résoudre..."""
+    parler(question)
+    r, source = _MIC["r"], _MIC["source"]
+    if r is None:
+        try:
+            return input(question + " > ").strip() or "(pas de réponse)"
+        except EOFError:
+            return "(pas de réponse)"
+    for _ in range(2):
+        rep = _ecouter_suite(r, source, timeout=20)
+        if rep:
+            print(f"   (réponse : {rep})")
+            return rep
+        parler("Je n'ai pas entendu, tu peux répéter ?")
+    return "(l'utilisateur n'a pas répondu)"
+
+
+# ------------------------------ Voir l'écran ---------------------------------
+def web_regarder(question: str = "Décris ce qu'on voit à l'écran.") -> str:
+    """Prend une capture du navigateur de Jarvis et la fait analyser par l'IA (images, captcha, mise en
+    page, graphiques, boutons sans texte...). question = ce qu'il faut chercher ou décrire."""
+    img = _web(lambda: _page().screenshot(type="jpeg", quality=70))
+    if isinstance(img, str):
+        return img
+    from google.genai import types
+    for modele in MODELES_GEMINI:
+        try:
+            rep = _client().models.generate_content(
+                model=modele, contents=[types.Part.from_bytes(data=img, mime_type="image/jpeg"),
+                                        "Réponds en français, de façon précise et concise. " + question])
+            return rep.text or "Je ne vois rien de particulier."
+        except Exception as e:
+            if any(k in str(e) for k in ("429", "404", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE")):
+                continue
+            return f"Analyse de l'écran impossible : {e}"
+    return "Analyse de l'écran impossible : quotas Gemini épuisés pour le moment."
+
+
+# -------------------------------- WhatsApp Web ------------------------------
+_WA_RECHERCHE = ('#side div[contenteditable="true"], div[contenteditable="true"][data-tab="3"], '
+                 'input[aria-label*="Rechercher"], input[aria-label*="Search"]')
+_WA_SAISIE = ('#main footer div[contenteditable="true"], footer div[contenteditable="true"][data-tab="10"], '
+              '#main div[contenteditable="true"][role="textbox"]')
+
+
+def _wa_page():
+    """Onglet WhatsApp Web (ouvert si besoin). Renvoie (page, message d'erreur ou None)."""
+    page = _page()
+    if "web.whatsapp.com" not in page.url:
+        page.bring_to_front()
+        page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=30000)
+    for _ in range(40):
+        if page.locator("#side, #pane-side").count():
+            return page, None
+        if page.locator("canvas[aria-label], [data-ref]").count() or "Scan" in page.content()[:20000]:
+            time.sleep(1)
+            if not page.locator("#side, #pane-side").count():
+                return page, ("WhatsApp Web demande de scanner le QR code : sur le téléphone, ouvre WhatsApp > "
+                              "Appareils connectés > Connecter un appareil, puis scanne l'écran. C'est à faire "
+                              "une seule fois. Demande à l'utilisateur de le faire puis réessaie.")
+        time.sleep(0.5)
+    return page, "WhatsApp Web ne s'est pas chargé."
+
+
+def whatsapp_ouvrir_discussion(nom: str) -> str:
+    """Ouvre WhatsApp Web dans le navigateur de Jarvis et la discussion avec un contact ou un groupe
+    (par son nom). Renvoie les derniers messages de la discussion."""
+    def f():
+        page, err = _wa_page()
+        if err:
+            return err
+        boite = page.locator(_WA_RECHERCHE).first
+        boite.click(timeout=8000)
+        page.keyboard.press("Control+a")
+        page.keyboard.press("Backspace")
+        page.keyboard.type(nom, delay=40)
+        time.sleep(1.5)
+        res = page.locator(f'#pane-side span[title*="{nom}" i]').first
+        if res.count():
+            _surligner(res)
+            res.click()
+        else:
+            page.keyboard.press("Enter")
+        time.sleep(1.2)
+        if not page.locator("#main").count():
+            return f"Je ne trouve pas de discussion « {nom} » sur WhatsApp."
+        return _wa_messages(page, 10)
+    return _web(f)
+
+
+def _wa_messages(page, n):
+    msgs = page.evaluate("""(n) => {
+      const rows = [...document.querySelectorAll('#main [data-pre-plain-text]')].slice(-n);
+      return rows.map(r => {
+        const entete = r.getAttribute('data-pre-plain-text') || '';
+        const texte = [...r.querySelectorAll('span.selectable-text, span[dir]')].map(s => s.innerText).join(' ').trim()
+                      || r.innerText.trim();
+        const moi = !!r.closest('.message-out');
+        return (moi ? '[MOI] ' : '') + entete.trim() + ' ' + texte;
+      });
+    }""", n)
+    titre = page.evaluate("() => (document.querySelector('#main header span[title], #main header span[dir=auto]') "
+                          "|| {}).innerText || ''")
+    if not msgs:
+        visible = _texte_visible(page, 3000)
+        return f"Discussion : {titre}\n(je n'arrive pas à isoler les messages, voici le texte visible)\n{visible}"
+    return f"Discussion : {titre}\nDerniers messages (du plus ancien au plus récent) :\n" + "\n".join(msgs)
+
+
+def whatsapp_lire_messages(nombre: int = 10) -> str:
+    """Lit les derniers messages de la discussion WhatsApp ouverte ([MOI] = messages de l'utilisateur)."""
+    def f():
+        page, err = _wa_page()
+        if err:
+            return err
+        if not page.locator("#main").count():
+            return "Aucune discussion n'est ouverte : utilise whatsapp_ouvrir_discussion."
+        return _wa_messages(page, max(1, min(int(nombre), 50)))
+    return _web(f)
+
+
+def whatsapp_discussions_non_lues() -> str:
+    """Liste les discussions WhatsApp qui ont des messages non lus (avec le dernier message)."""
+    def f():
+        page, err = _wa_page()
+        if err:
+            return err
+        lignes = page.evaluate("""() => [...document.querySelectorAll('#pane-side [role="listitem"], #pane-side [role="row"]')]
+          .map(r => r.innerText.replace(/\\n+/g, ' | ').trim())
+          .filter(t => /\\|\\s*\\d+\\s*$/.test(t) || /non lu|unread/i.test(t)).slice(0, 20)""")
+        return ("Discussions non lues :\n" + "\n".join(lignes)) if lignes else "Aucun message non lu visible."
+    return _web(f)
+
+
+def whatsapp_envoyer(message: str) -> str:
+    """Écrit et ENVOIE un message (émojis acceptés 😀👍🔥) dans la discussion WhatsApp ouverte.
+    Avant d'envoyer, fais valider le texte par l'utilisateur avec demander_utilisateur, sauf s'il a
+    dicté exactement le message et dit de l'envoyer."""
+    def f():
+        page, err = _wa_page()
+        if err:
+            return err
+        saisie = page.locator(_WA_SAISIE).first
+        if not saisie.count():
+            return "Aucune discussion n'est ouverte : utilise whatsapp_ouvrir_discussion."
+        _surligner(saisie)
+        saisie.click(timeout=8000)
+        lignes = message.split("\n")
+        for i, l in enumerate(lignes):
+            page.keyboard.insert_text(l)              # insert_text gère les émojis
+            if i < len(lignes) - 1:
+                page.keyboard.press("Shift+Enter")
+        time.sleep(0.4)
+        page.keyboard.press("Enter")
+        time.sleep(1.0)
+        dernier = _wa_messages(page, 1)
+        return "Message envoyé (vérifié dans la discussion) : " + dernier.split("\n")[-1]
+    return _web(f)
+
+
+def whatsapp_envoyer_sticker(numero: int = 1, recherche: str = "") -> str:
+    """Envoie un sticker dans la discussion WhatsApp ouverte : numero = position dans les stickers
+    (1 = le premier / plus récent), recherche = mot pour chercher un sticker (ex : « merci », « rire »)."""
+    def f():
+        page, err = _wa_page()
+        if err:
+            return err
+        if not page.locator("#main footer").count():
+            return "Aucune discussion n'est ouverte."
+        for sel in ('#main footer [aria-label*="moji" i]', '#main footer [data-icon*="emoji"]',
+                    '#main footer [aria-label*="xpression" i]', '#main footer [data-icon*="expressions"]'):
+            b = page.locator(sel).first
+            if b.count() and b.is_visible():
+                b.click()
+                break
+        else:
+            return "Je ne trouve pas le bouton émojis/stickers de WhatsApp."
+        time.sleep(0.8)
+        onglet = _trouver(page, "Stickers") or _trouver(page, "Autocollants")
+        if onglet is not None:
+            onglet.click()
+            time.sleep(1.2)
+        if recherche:
+            champ = page.locator('[aria-label*="echercher" i][contenteditable="true"], input[placeholder*="echercher" i], '
+                                 'input[placeholder*="earch" i]').first
+            if champ.count():
+                champ.click()
+                page.keyboard.type(recherche, delay=40)
+                time.sleep(1.5)
+        stickers = page.locator('img[src*="sticker" i], [data-testid*="sticker" i] img, img[alt*="sticker" i], '
+                                'div[role="button"] img[draggable="false"]')
+        n = stickers.count()
+        if n == 0:
+            page.keyboard.press("Escape")
+            return "Je ne trouve aucun sticker (la liste est peut-être vide sur ce compte)."
+        cible = stickers.nth(max(0, min(int(numero) - 1, n - 1)))
+        _surligner(cible)
+        cible.click()
+        time.sleep(1.0)
+        page.keyboard.press("Escape")
+        return f"Sticker n°{numero} envoyé ({n} stickers disponibles)."
+    return _web(f)
+
+
+# ----------------------------- Récolte de données ---------------------------
+_RE_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}")
+_RE_TEL = re.compile(r"(?:\+|00)?\d[\d .\-()]{7,18}\d")
+_EXT_FICHIERS = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".zip", ".rar", ".mp4", ".mp3",
+                 ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".exe", ".dmg", ".apk", ".css", ".js")
+
+
+def _analyser_html(html, url):
+    """Extrait d'une page : titre, texte, titres, liens, e-mails, téléphones, images, tableaux."""
+    import urllib.parse
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript", "svg", "iframe"]):
+        t.decompose()
+    texte = re.sub(r"\n\s*\n+", "\n", soup.get_text("\n", strip=True))
+    liens = []
+    for a in soup.find_all("a", href=True):
+        h = urllib.parse.urljoin(url, a["href"]).split("#")[0]
+        liens.append((a.get_text(" ", strip=True)[:120], h))
+    emails = set(_RE_EMAIL.findall(texte))
+    emails |= {h[7:].split("?")[0] for _, h in liens if h.lower().startswith("mailto:")}
+    tels = {h[4:] for _, h in liens if h.lower().startswith("tel:")}
+    for m in _RE_TEL.findall(texte):
+        m = m.strip()
+        chiffres = re.sub(r"\D", "", m)
+        groupes = [g for g in re.split(r"[ .\-()]+", m) if g]
+        if not 8 <= len(chiffres) <= 15 or re.search(r"\b1[0-9]{3}\s*[-–]\s*[12][0-9]{3}\b", m):
+            continue                       # trop court/long, ou une période « 1645-1689 »
+        if m.startswith(("+", "00")) or (len(groupes) >= 3 and all(len(g) <= 4 for g in groupes)):
+            tels.add(m)
+    tableaux = []
+    for tab in soup.find_all("table"):
+        lignes = [[c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])] for tr in tab.find_all("tr")]
+        lignes = [l for l in lignes if any(l)]
+        if len(lignes) >= 2:
+            tableaux.append(lignes)
+    return {
+        "url": url,
+        "titre": (soup.title.get_text(strip=True) if soup.title else "")[:300],
+        "description": ((soup.find("meta", attrs={"name": "description"}) or {}).get("content") or "")[:500],
+        "titres": [h.get_text(" ", strip=True)[:200] for h in soup.find_all(["h1", "h2", "h3"])][:60],
+        "texte": texte,
+        "emails": sorted(emails), "telephones": sorted(tels),
+        "images": [urllib.parse.urljoin(url, i["src"]) for i in soup.find_all("img", src=True)][:100],
+        "liens": liens, "tableaux": tableaux,
+    }
+
+
+def _rendre_avec_navigateur(url):
+    """Pour les sites faits en JavaScript : on charge la page dans un onglet du navigateur de Jarvis."""
+    def f():
+        _page()
+        p = _WEB["ctx"].new_page()
+        try:
+            p.goto(url, wait_until="domcontentloaded", timeout=30000)
+            _attendre_page(p)
+            return p.content()
+        finally:
+            p.close()
+    r = _web(f, 60)
+    return r if isinstance(r, str) and r.lstrip().startswith("<") else None
+
+
+def recolter_site(adresse: str, pages_max: int = 30, avec_navigateur: bool = False) -> str:
+    """Récolte automatiquement les données d'un site web entier (ou d'une seule page avec pages_max=1) :
+    texte de chaque page, titres, e-mails, téléphones, tableaux, liens, images. Visite les pages du
+    même site (en respectant robots.txt) et enregistre tout dans ~/Jarvis_donnees/<site>/ :
+    texte.md (tout le texte), pages.json, contacts.csv, liens.csv et les tableaux en CSV.
+    avec_navigateur=True pour les sites qui s'affichent en JavaScript (plus lent)."""
+    import csv
+    import urllib.parse
+    import urllib.robotparser
+    import requests
+    debut = adresse.strip()
+    if not re.match(r"^https?://", debut):
+        debut = "https://" + debut
+    dom = urllib.parse.urlparse(debut).netloc
+    base = f"{urllib.parse.urlparse(debut).scheme}://{dom}"
+    robots = urllib.robotparser.RobotFileParser(base + "/robots.txt")
+    try:
+        robots.read()
+    except Exception:
+        robots = None
+    agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
+    session = requests.Session()
+    session.headers.update({"User-Agent": agent, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.6"})
+    a_voir, vus, pages, ignorees = [debut], set(), [], 0
+    pages_max = max(1, min(int(pages_max), 300))
+    t0 = time.time()
+    while a_voir and len(pages) < pages_max and time.time() - t0 < 600:
+        url = a_voir.pop(0)
+        if url in vus:
+            continue
+        vus.add(url)
+        if robots and not robots.can_fetch(agent, url):
+            ignorees += 1
+            continue
+        try:
+            r = session.get(url, timeout=15)
+            if "html" not in r.headers.get("content-type", ""):
+                continue
+            html = r.text
+        except Exception as e:
+            print(f"   [récolte : {url[:80]} inaccessible : {type(e).__name__}]")
+            if not avec_navigateur:
+                continue
+            html = ""
+        info = _analyser_html(html, url) if html else None
+        if avec_navigateur or info is None or len(info["texte"]) < 300:      # page vide : sûrement du JavaScript
+            rendu = _rendre_avec_navigateur(url)
+            if rendu:
+                info = _analyser_html(rendu, url)
+        if info is None:
+            continue
+        pages.append(info)
+        print(f"   [récolte {len(pages)}/{pages_max} : {url[:90]}]")
+        for _, h in info["liens"]:
+            p = urllib.parse.urlparse(h)
+            if (p.scheme in ("http", "https") and p.netloc == dom and h not in vus and h not in a_voir
+                    and not p.path.lower().endswith(_EXT_FICHIERS)):
+                a_voir.append(h)
+        time.sleep(0.4)                     # politesse : on ne surcharge pas le site
+    if not pages:
+        return f"Je n'ai pu récolter aucune page de {dom} (site inaccessible, bloqué ou interdit par robots.txt)."
+    dossier = os.path.join(DOSSIER_DONNEES, re.sub(r"[^\w.-]", "_", dom) + "_" +
+                           datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+    os.makedirs(dossier, exist_ok=True)
+    with open(os.path.join(dossier, "pages.json"), "w", encoding="utf-8") as f:
+        json.dump(pages, f, ensure_ascii=False, indent=1)
+    with open(os.path.join(dossier, "texte.md"), "w", encoding="utf-8") as f:
+        for p in pages:
+            f.write(f"# {p['titre'] or p['url']}\n{p['url']}\n\n{p['texte']}\n\n---\n\n")
+    emails = sorted({e for p in pages for e in p["emails"]})
+    tels = sorted({t for p in pages for t in p["telephones"]})
+    with open(os.path.join(dossier, "contacts.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["type", "valeur", "page"])
+        for p in pages:
+            for e in p["emails"]:
+                w.writerow(["email", e, p["url"]])
+            for t in p["telephones"]:
+                w.writerow(["telephone", t, p["url"]])
+    with open(os.path.join(dossier, "liens.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["page", "texte du lien", "adresse"])
+        for p in pages:
+            for t, h in p["liens"]:
+                w.writerow([p["url"], t, h])
+    n_tab = 0
+    for p in pages:
+        for tab in p["tableaux"]:
+            n_tab += 1
+            with open(os.path.join(dossier, f"tableau_{n_tab}.csv"), "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerows(tab)
+    _CWD["d"] = dossier
+    resume = (f"Récolte terminée : {len(pages)} pages de {dom}, {len(emails)} e-mails, {len(tels)} téléphones, "
+              f"{n_tab} tableaux. Enregistré dans {dossier} (texte.md, pages.json, contacts.csv, liens.csv"
+              f"{', tableau_N.csv' if n_tab else ''}).")
+    if ignorees:
+        resume += f" {ignorees} pages ignorées car interdites par robots.txt."
+    if emails:
+        resume += " E-mails : " + ", ".join(emails[:10])
+    if tels:
+        resume += " | Téléphones : " + ", ".join(tels[:10])
+    resume += "\nDébut du texte récolté :\n" + pages[0]["texte"][:2500]
+    return resume
+
+
+def web_extraire_page() -> str:
+    """Récolte les données de la page ACTUELLEMENT ouverte dans le navigateur de Jarvis (utile après
+    s'être connecté ou avoir fait une recherche) : texte, e-mails, téléphones, tableaux, liens.
+    Enregistre tout dans ~/Jarvis_donnees/."""
+    def f():
+        page = _page()
+        return page.content(), page.url
+    r = _web(f)
+    if isinstance(r, str):
+        return r
+    html, url = r
+    import csv
+    import urllib.parse
+    info = _analyser_html(html, url)
+    dom = urllib.parse.urlparse(url).netloc or "page"
+    dossier = os.path.join(DOSSIER_DONNEES, re.sub(r"[^\w.-]", "_", dom) + "_page_" +
+                           datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(dossier, exist_ok=True)
+    with open(os.path.join(dossier, "page.json"), "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=1)
+    with open(os.path.join(dossier, "texte.md"), "w", encoding="utf-8") as f:
+        f.write(f"# {info['titre']}\n{url}\n\n{info['texte']}\n")
+    for i, tab in enumerate(info["tableaux"], 1):
+        with open(os.path.join(dossier, f"tableau_{i}.csv"), "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(tab)
+    _CWD["d"] = dossier
+    return (f"Données de la page enregistrées dans {dossier} : {len(info['emails'])} e-mails, "
+            f"{len(info['telephones'])} téléphones, {len(info['tableaux'])} tableaux, {len(info['liens'])} liens. "
+            f"E-mails : {', '.join(info['emails'][:10])} | Téléphones : {', '.join(info['telephones'][:10])}\n"
+            f"Début du texte :\n{info['texte'][:2500]}")
+
+
 def _resume_appel(nom, kwargs):
     """Résumé court d'un appel d'outil (sans les gros contenus), pour le journal et l'historique."""
     morceaux = []
@@ -1500,7 +2285,11 @@ _OUTILS_BRUTS = [executer_commande, lancer_en_arriere_plan, ouvrir_terminal, tap
                  ouvrir_application, ouvrir_dans_editeur, contexte_editeur, ouvrir_url, chercher_sur_internet,
                  changer_dossier, creer_dossier, lister_dossier, lire_fichier, ecrire_fichier,
                  modifier_fichier, verifier_code, supprimer, fermer_terminal, fermer_application,
-                 quitter_jarvis, regler_volume, date_et_heure]
+                 quitter_jarvis, regler_volume, date_et_heure,
+                 web_ouvrir, web_defiler, web_lire, web_cliquer, web_taper, web_touche, web_retour,
+                 web_liens, web_extraire_page, recolter_site, web_fermer, web_lire_a_voix_haute,
+                 web_regarder, demander_utilisateur, whatsapp_ouvrir_discussion, whatsapp_lire_messages,
+                 whatsapp_discussions_non_lues, whatsapp_envoyer, whatsapp_envoyer_sticker]
 OUTILS = [_avec_journal(f) for f in _OUTILS_BRUTS]
 OUTILS_PAR_NOM = {f.__name__: f for f in OUTILS}
 
@@ -1547,6 +2336,29 @@ def _consigne():
         "- Terminal : « ouvre le terminal » = ouvrir_terminal ; « tape / lance / exécute X dans le terminal » = "
         "taper_dans_terminal (la commande s'affiche et s'exécute dans la fenêtre visible). Pour ton travail "
         "interne (créer, installer, vérifier) sans que l'utilisateur ait demandé à voir, utilise executer_commande.\n"
+        "- Web : pour aller sur un site, lire, faire défiler, cliquer, remplir un formulaire ou chercher "
+        "une information, utilise TON navigateur visible : web_ouvrir (adresse ou recherche Google), puis "
+        "web_defiler / web_lire / web_cliquer / web_taper / web_touche / web_retour. L'utilisateur voit tout. "
+        "« Lis-moi la page » = lis le texte visible et résume-le à voix haute, puis défile si on te demande "
+        "la suite. Pour une question d'actualité ou un fait que tu ne connais pas sûrement, va vérifier sur le "
+        "web. « Récolte / récupère / scrape les données de tel site » = recolter_site (site entier) ou "
+        "web_extraire_page (page affichée), puis dis combien de pages, e-mails, téléphones et où c'est "
+        "enregistré. « Lis-moi / lis la page / lis l'article » = web_lire_a_voix_haute (il lit en défilant "
+        "tout seul) ; après, une phrase très courte seulement. "
+        "Démarches en ligne (créer un compte, s'inscrire, remplir un formulaire, réserver...) : fais-les "
+        "toi-même étape par étape dans le navigateur ; chaque fois qu'il te manque une information (nom, date "
+        "de naissance, mot de passe souhaité, code de vérification reçu par SMS ou e-mail, choix), appelle "
+        "demander_utilisateur puis continue. Un captcha ou une vérification « je ne suis pas un robot » : "
+        "demande à l'utilisateur de le faire dans la fenêtre, puis continue. web_regarder sert à voir ce qui "
+        "n'est pas du texte (images, captcha, boutons sans texte).\n"
+        "- WhatsApp : whatsapp_ouvrir_discussion (lit aussi les derniers messages), whatsapp_lire_messages, "
+        "whatsapp_discussions_non_lues, whatsapp_envoyer (émojis bienvenus quand ça colle au ton), "
+        "whatsapp_envoyer_sticker. Pour répondre à quelqu'un : lis ses derniers messages, résume-les, propose "
+        "une réponse (ou prends celle que l'utilisateur dicte) et fais-la valider avec demander_utilisateur "
+        "avant d'envoyer, sauf s'il a dicté le message exact et dit « envoie ». Tu écris au nom de "
+        "l'utilisateur : adopte son ton, en français naturel.\n"
+        "- Ne dis JAMAIS « c'est fait » sans avoir appelé l'outil dans CETTE demande.\n"
+        "- ouvrir_url sert seulement à montrer une page dans le navigateur habituel de l'utilisateur.\n"
         "- Fermer / quitter : « ferme le terminal » = fermer_terminal ; « ferme Firefox / Devin / ... » = "
         "fermer_application ; « supprime ... » = supprimer ; « quitte / éteins-toi / arrête-toi » = quitter_jarvis. "
         "Ne dis JAMAIS qu'une chose est fermée, supprimée ou faite si l'outil a répondu ÉCHEC, ATTENTION ou "
@@ -1641,8 +2453,9 @@ class Discussion:
 
 
 # ---------------------------- Cerveau de secours : Groq ----------------------
-def _schema_outil(fn):
-    """Transforme une fonction Python en description d'outil (format OpenAI/Groq)."""
+def _schema_outil(fn, court=False):
+    """Transforme une fonction Python en description d'outil (format OpenAI/Groq).
+    court=True : description réduite à l'essentiel (Groq gratuit est limité en tokens par minute)."""
     types_json = {str: "string", int: "integer", bool: "boolean", float: "number"}
     proprietes, requis = {}, []
     for nom, p in inspect.signature(fn).parameters.items():
@@ -1651,9 +2464,52 @@ def _schema_outil(fn):
             requis.append(nom)
     return {"type": "function", "function": {
         "name": fn.__name__,
-        "description": " ".join((fn.__doc__ or "").split()),
+        "description": _desc_courte(fn.__doc__) if court else " ".join((fn.__doc__ or "").split()),
         "parameters": {"type": "object", "properties": proprietes, "required": requis},
     }}
+
+
+def _desc_courte(doc):
+    texte = " ".join((doc or "").split())
+    phrases = re.split(r"(?<=[.!?])\s+", texte)
+    court = phrases[0]
+    for p in phrases[1:]:
+        if len(court) + len(p) > 230:
+            break
+        court += " " + p
+    return court[:300]
+
+
+# Groq : on n'envoie que les outils utiles à la demande (sinon ~6000 tokens par requête)
+_GROUPES_OUTILS = {
+    "web": (re.compile(r"web|site|page|internet|google|navigat|cherche|recherche|wiki|compte|inscri|formulaire|"
+                       r"défil|descend|scroll|clique|scrap|récolt|donnée|http|www|\.com|\.org|\.fr|lis[- ]moi|"
+                       r"article|actualit|youtube|facebook|gmail|connecte|réserv|achète|commande", re.I),
+            {"web_ouvrir", "web_defiler", "web_lire", "web_cliquer", "web_taper", "web_touche", "web_retour",
+             "web_liens", "web_extraire_page", "recolter_site", "web_fermer", "web_lire_a_voix_haute",
+             "web_regarder"}),
+    "whatsapp": (re.compile(r"whats|wa\b|message|répond|écri[st]?\s+à|sticker|émoji|emoji|discussion", re.I),
+                 {"whatsapp_ouvrir_discussion", "whatsapp_lire_messages", "whatsapp_discussions_non_lues",
+                  "whatsapp_envoyer", "whatsapp_envoyer_sticker", "web_regarder", "web_fermer"}),
+    "code": (re.compile(r"code|fichier|dossier|projet|site|programme|script|éditeur|devin|vs ?code|windsurf|"
+                        r"vérifie|corrige|bug|erreur|crée|écri", re.I),
+             {"ouvrir_dans_editeur", "contexte_editeur", "lister_dossier", "lire_fichier", "ecrire_fichier",
+              "modifier_fichier", "verifier_code", "creer_dossier", "changer_dossier", "supprimer"}),
+}
+_OUTILS_TOUJOURS = {"executer_commande", "lancer_en_arriere_plan", "ouvrir_terminal", "taper_dans_terminal",
+                    "fermer_terminal", "ouvrir_application", "fermer_application", "ouvrir_url",
+                    "demander_utilisateur", "quitter_jarvis", "regler_volume", "date_et_heure",
+                    "lire_fichier", "ecrire_fichier", "creer_dossier", "supprimer"}
+
+
+def _outils_pour(texte, historique):
+    """Les outils utiles pour cette demande (en tenant compte des 2 derniers échanges)."""
+    contexte = texte + " " + " ".join(u + " " + a for u, a in historique[-2:])
+    noms = set(_OUTILS_TOUJOURS)
+    for motif, groupe in _GROUPES_OUTILS.values():
+        if motif.search(contexte):
+            noms |= groupe
+    return [_schema_outil(f, court=True) for f in OUTILS if f.__name__ in noms]
 
 
 class GroqErreur(Exception):
@@ -1669,7 +2525,7 @@ class GroqChat:
     def __init__(self, modele):
         self.modele = modele
         self.cle = _lire_cle("GROQ_API_KEY")
-        self.outils = [_schema_outil(f) for f in OUTILS]
+        self.outils = []
 
     def disponible(self):
         return bool(self.cle)
@@ -1706,6 +2562,7 @@ class GroqChat:
         for u, a in historique:
             messages += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
         messages.append({"role": "user", "content": texte})
+        self.outils = _outils_pour(texte, historique)
         for _ in range(MAX_ETAPES):
             msg = self._requete(messages)["choices"][0]["message"]
             appels = msg.get("tool_calls")
@@ -1751,6 +2608,11 @@ def _classer_erreur(e):
     if "Connection" in type(e).__name__:
         return "réseau", 15
     return f"erreur {type(e).__name__}", 20
+
+
+_ANNONCE_ACTION = re.compile(
+    r"\b(c'est fait|voilà, c'est|j'ai (bien )?(ouvert|fermé|lancé|créé|supprimé|tapé|envoyé|cliqué|écrit|"
+    r"modifié|installé|exécuté|réglé|cherché|récolté))", re.IGNORECASE)
 
 
 class Cerveau:
@@ -1823,6 +2685,11 @@ class Cerveau:
             try:
                 t0 = time.time()
                 rep = c.send_message(envoi, self.historique)
+                if not _JOURNAL and _ANNONCE_ACTION.search(rep.text or ""):
+                    print("   (il annonce une action sans l'avoir faite : je lui demande de la faire)")
+                    rep = c.send_message(envoi + "\n\n(ATTENTION : tu n'as appelé AUCUN outil. Si une action est "
+                                         "demandée, appelle l'outil maintenant ; sinon réponds sans prétendre "
+                                         "avoir agi.)", self.historique)
                 duree = time.time() - t0
                 if duree > 12 and not _JOURNAL:      # question simple mais modèle surchargé : on l'évite 10 min
                     print(f"   ({c.modele} a été lent ({duree:.0f} s) : je l'évite pendant 10 min)")
@@ -1867,7 +2734,11 @@ _ACTIONS_DITES = {
     "ecrire_fichier": "écrit le fichier", "modifier_fichier": "modifié le fichier",
     "verifier_code": "vérifié le code", "regler_volume": "réglé le volume",
     "supprimer": "supprimé ce que tu m'as demandé", "fermer_terminal": "fermé le terminal",
-    "fermer_application": "fermé l'application",
+    "fermer_application": "fermé l'application", "web_ouvrir": "ouvert la page web",
+    "web_defiler": "fait défiler la page", "web_cliquer": "cliqué", "web_taper": "tapé le texte",
+    "recolter_site": "récolté les données du site", "web_extraire_page": "récolté les données de la page",
+    "web_fermer": "fermé le navigateur", "whatsapp_envoyer": "envoyé le message",
+    "whatsapp_envoyer_sticker": "envoyé le sticker", "whatsapp_ouvrir_discussion": "ouvert la discussion",
 }
 
 
@@ -1923,6 +2794,9 @@ def traiter(commande, client, chat):
     if _ETAT["quitter"]:
         parler(reponse)
         return False
+    if _INTERROMPU["oui"]:               # coupé pendant une lecture : on écoute au lieu de parler
+        print(f"   (réponse non dite, tu m'as coupé : {reponse})")
+        return True
     if minuteur:
         minuteur.cancel()
     print(f"   (cerveau + actions : {time.time() - t0:.1f}s)")
