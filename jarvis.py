@@ -1228,6 +1228,168 @@ def date_et_heure() -> str:
     return f"{jours[n.weekday()]} {n.strftime('%d/%m/%Y')}, {n.strftime('%H:%M')}"
 
 
+# ------------------------- Fermer, supprimer, quitter ------------------------
+import signal as _signal
+
+_ETAT = {"quitter": False}
+
+
+def _ancetres():
+    """PID de Jarvis et de tous ses parents (le terminal / l'éditeur dans lequel il tourne)."""
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except Exception:
+            break
+    return pids
+
+
+def _vivant(pid):
+    """True si le processus tourne encore (un « zombie » déjà arrêté compte comme fermé)."""
+    try:
+        os.waitpid(pid, os.WNOHANG)       # récupère les applis lancées par Jarvis lui-même
+    except (ChildProcessError, OSError):
+        pass
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    except OSError:
+        return False
+
+
+def _tuer(pids, attendre=3.0):
+    """SIGTERM (fermeture propre), puis SIGKILL pour ceux qui résistent. Renvoie le nb de processus arrêtés."""
+    for p in pids:
+        try:
+            os.kill(p, _signal.SIGTERM)
+        except OSError:
+            pass
+    fin = time.time() + attendre
+    while time.time() < fin and any(_vivant(p) for p in pids):
+        time.sleep(0.1)
+    for p in pids:
+        if _vivant(p):
+            try:
+                os.kill(p, _signal.SIGKILL)
+            except OSError:
+                pass
+    time.sleep(0.2)
+    return sum(1 for p in pids if not _vivant(p))
+
+
+def fermer_terminal() -> str:
+    """Ferme la fenêtre du terminal de Jarvis (celui ouvert avec ouvrir_terminal)."""
+    fifo = _fichiers_terminal()[0]
+    try:
+        with open(fifo + ".pid") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        pid = None
+    if not pid or not _vivant(pid):
+        return "Le terminal de Jarvis n'était pas ouvert (rien à fermer)."
+    try:
+        os.killpg(os.getpgid(pid), _signal.SIGHUP)
+    except OSError:
+        pass
+    _tuer([pid], 2)
+    if _vivant(pid):
+        return "ÉCHEC : le terminal de Jarvis est toujours ouvert."
+    if os.path.exists(fifo):
+        os.remove(fifo)
+    return "Terminal de Jarvis fermé (vérifié : il ne tourne plus)."
+
+
+def _noms_processus(nom):
+    """Noms de programmes possibles pour une application (« devin » -> devin-desktop, etc.)."""
+    nom = nom.lower().strip()
+    noms = {nom, nom.replace(" ", "-"), nom.replace(" ", "")}
+    exec_ = _trouver_application(nom)
+    if exec_:
+        try:
+            noms.add(os.path.basename(shlex.split(re.sub(r"%[a-zA-Z%]", "", exec_))[0]).lower())
+        except Exception:
+            pass
+    alias = {"chrome": "chrome", "google chrome": "chrome", "vscode": "code", "vs code": "code",
+             "visual studio code": "code", "devin": "devin-desktop", "windsurf": "devin-desktop",
+             "calculatrice": "gnome-calculator", "fichiers": "nautilus", "navigateur": "firefox"}
+    if nom in alias:
+        noms.add(alias[nom])
+    return {n for n in noms if len(n) >= 3}
+
+
+def fermer_application(nom: str, forcer: bool = False) -> str:
+    """Ferme (quitte) une application ouverte : Firefox, Chrome, Spotify, VLC, Devin, VS Code, calculatrice...
+    Ferme TOUTES ses fenêtres. Pour le terminal de Jarvis, utilise fermer_terminal.
+    forcer=True seulement si l'utilisateur confirme vouloir fermer l'application dans laquelle Jarvis
+    tourne lui-même (Jarvis s'arrêtera alors aussi)."""
+    if re.search(r"\b(terminal|console|ptyxis)\b", nom.lower()) and not forcer:
+        return fermer_terminal()
+    noms = _noms_processus(nom)
+    moi = _ancetres()
+    trouves, proteges = [], []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip().lower()
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                exe = os.path.basename(f.read().split(b"\0")[0].decode(errors="ignore")).lower()
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+        except Exception:
+            continue
+        if any(n == comm or n == exe or (len(n) >= 4 and comm.startswith(n[:15])) for n in noms):
+            (proteges if pid in moi else trouves).append(pid)
+    if proteges and not forcer:
+        return (f"ATTENTION : Jarvis tourne à l'intérieur de « {nom} ». Le fermer arrêterait Jarvis aussi. "
+                "Demande confirmation à l'utilisateur ; s'il confirme, rappelle cet outil avec forcer=True.")
+    cibles = trouves + (proteges if forcer else [])
+    if not cibles:
+        return f"Aucune application « {nom} » n'est ouverte (rien à fermer)."
+    if forcer and proteges:
+        parler(f"Je ferme {nom}, je vais donc m'arrêter aussi. À bientôt.")
+    arretes = _tuer(cibles)
+    if arretes < len(cibles):
+        return f"ÉCHEC partiel : {arretes} processus sur {len(cibles)} de « {nom} » arrêtés."
+    return f"« {nom} » est fermé (vérifié : {arretes} processus arrêtés)."
+
+
+def supprimer(chemin: str) -> str:
+    """Supprime définitivement un fichier ou un dossier (avec tout son contenu)."""
+    cible = _chemin(chemin)
+    interdits = {"/", os.path.expanduser("~"), "/home", "/etc", "/usr", "/bin", "/boot", "/var", "/lib"}
+    if cible in interdits:
+        return f"REFUSÉ : je ne supprime pas {cible} en entier, c'est un dossier vital."
+    if not os.path.lexists(cible):
+        return f"Rien à supprimer : {cible} n'existe pas."
+    if CONFIRMER_ACTIONS_SENSIBLES and not _confirmer(f"Je supprime {os.path.basename(cible)} ?"):
+        return "REFUSÉ : l'utilisateur n'a pas confirmé."
+    try:
+        if os.path.isdir(cible) and not os.path.islink(cible):
+            shutil.rmtree(cible)
+        else:
+            os.remove(cible)
+    except Exception as e:
+        return f"Erreur : {e}"
+    if os.path.lexists(cible):
+        return f"ÉCHEC : {cible} existe toujours."
+    if _CWD["d"].startswith(cible):
+        _CWD["d"] = os.path.dirname(cible)
+    return f"Supprimé (vérifié) : {cible}"
+
+
+def quitter_jarvis() -> str:
+    """Arrête complètement Jarvis (le programme s'éteint après avoir répondu). À utiliser quand
+    l'utilisateur dit « quitte », « éteins-toi », « arrête-toi », « au revoir Jarvis »..."""
+    _ETAT["quitter"] = True
+    return "Jarvis va s'arrêter juste après cette réponse : dis au revoir en une phrase courte."
+
+
 def _resume_appel(nom, kwargs):
     """Résumé court d'un appel d'outil (sans les gros contenus), pour le journal et l'historique."""
     morceaux = []
@@ -1261,7 +1423,8 @@ def _avec_journal(fn):
 _OUTILS_BRUTS = [executer_commande, lancer_en_arriere_plan, ouvrir_terminal, taper_dans_terminal,
                  ouvrir_application, ouvrir_dans_editeur, contexte_editeur, ouvrir_url, chercher_sur_internet,
                  changer_dossier, creer_dossier, lister_dossier, lire_fichier, ecrire_fichier,
-                 modifier_fichier, verifier_code, regler_volume, date_et_heure]
+                 modifier_fichier, verifier_code, supprimer, fermer_terminal, fermer_application,
+                 quitter_jarvis, regler_volume, date_et_heure]
 OUTILS = [_avec_journal(f) for f in _OUTILS_BRUTS]
 OUTILS_PAR_NOM = {f.__name__: f for f in OUTILS}
 
@@ -1308,6 +1471,10 @@ def _consigne():
         "- Terminal : « ouvre le terminal » = ouvrir_terminal ; « tape / lance / exécute X dans le terminal » = "
         "taper_dans_terminal (la commande s'affiche et s'exécute dans la fenêtre visible). Pour ton travail "
         "interne (créer, installer, vérifier) sans que l'utilisateur ait demandé à voir, utilise executer_commande.\n"
+        "- Fermer / quitter : « ferme le terminal » = fermer_terminal ; « ferme Firefox / Devin / ... » = "
+        "fermer_application ; « supprime ... » = supprimer ; « quitte / éteins-toi / arrête-toi » = quitter_jarvis. "
+        "Ne dis JAMAIS qu'une chose est fermée, supprimée ou faite si l'outil a répondu ÉCHEC, ATTENTION ou "
+        "« rien à » : répète honnêtement ce que l'outil a dit.\n"
         "- Tu ne peux pas cliquer ni taper au clavier dans les fenêtres graphiques des autres programmes. "
         "Pour agir dans un éditeur de code (Devin, Windsurf, VS Code), modifie directement les fichiers avec "
         "ecrire_fichier / modifier_fichier : l'éditeur se met à jour tout seul.\n"
@@ -1588,6 +1755,8 @@ _ACTIONS_DITES = {
     "creer_dossier": "créé le dossier", "changer_dossier": "changé de dossier",
     "ecrire_fichier": "écrit le fichier", "modifier_fichier": "modifié le fichier",
     "verifier_code": "vérifié le code", "regler_volume": "réglé le volume",
+    "supprimer": "supprimé ce que tu m'as demandé", "fermer_terminal": "fermé le terminal",
+    "fermer_application": "fermé l'application",
 }
 
 
@@ -1640,6 +1809,9 @@ def traiter(commande, client, chat):
         minuteur.start()
     t0 = time.time()
     reponse = demander_ia(client, chat, commande)
+    if _ETAT["quitter"]:
+        parler(reponse)
+        return False
     if minuteur:
         minuteur.cancel()
     print(f"   (cerveau + actions : {time.time() - t0:.1f}s)")
