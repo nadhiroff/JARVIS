@@ -86,8 +86,12 @@ SEUIL_VOIX_COURT = 0.55                   # ressemblance exigée pour une phrase
 SEUIL_VOIX_MOYEN = 0.62                   # entre 2 et 4 s
 SEUIL_VOIX = 0.70                         # ressemblance minimale (0 à 1). Il te rejette ? baisse (0.65). Il accepte les autres ? monte (0.8)
 INTERRUPTION = True                       # True = tu peux couper Jarvis en parlant (seulement avec TA voix)
-SEUIL_INTERRUPTION = 0.55                 # idem pour couper Jarvis (plus bas : sa voix se mélange à la tienne)
-FACTEUR_INTERRUPTION = 0.8                # volume minimal avant de tenter de te reconnaître pendant qu'il parle
+SEUIL_INTERRUPTION = 0.58                 # ressemblance pour METTRE EN PAUSE Jarvis quand tu parles (il vérifie ensuite)
+FACTEUR_INTERRUPTION = 1.0                # volume minimal avant de tenter de te reconnaître pendant qu'il parle
+# Quand il croit t'entendre, il se met en PAUSE et écoute ta phrase sans sa propre voix par-dessus.
+# Si c'est vraiment toi et une vraie demande : il s'arrête et te répond. Sinon (bruit, autre voix) : il REPREND.
+MOTS_STOP = re.compile(r"\b(stop|arrête|arrêtez|attends|attend|tais[- ]toi|chut|silence|pause|non|jarvis|"
+                       r"jarvice|djarvis|ok|bon|écoute|minute)\b", re.IGNORECASE)
 DEBUG_INTERRUPTION = True                 # True = affiche la ressemblance pendant qu'il parle (pour régler). Mets False quand c'est bon
 UN_INSTANT_APRES = None                   # N = dit « Un instant. » si la réponse met plus de N secondes (None = jamais)
 VOIX_FICHIER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voix_nadhir.npy")
@@ -113,7 +117,9 @@ _piper_voice = None
 _ENCODEUR = None        # modèle qui reconnaît les voix
 _EMPREINTE = None       # ton empreinte vocale (chargée depuis voix_nadhir.npy)
 _LECTURE = {"p": None}  # lecteur audio en cours (pour pouvoir le couper)
-_INTERROMPU = {"oui": False, "audio": None}   # tu as coupé Jarvis : début de ta phrase
+_INTERROMPU = {"oui": False, "audio": None, "texte": None}   # tu as coupé Jarvis : ta phrase
+_REPRISE = threading.Event()   # « clair » quand Jarvis est en pause pour vérifier si tu lui parles
+_REPRISE.set()
 _APPRIS = {"n": 0}                              # nombre de phrases qui ont affiné ton empreinte
 _DERNIER = {"audio": None}                     # dernier son entendu (pour vérifier la voix)
 _silence = None
@@ -284,6 +290,8 @@ def _lancer_et_attendre(cmd):
     _LECTURE["p"] = p
     if _INTERROMPU["oui"]:
         p.terminate()
+    elif not _REPRISE.is_set():
+        _pause_lecture(True)                 # démarré pile pendant une vérification : en pause aussi
     p.wait()
     _LECTURE["p"] = None
 
@@ -291,7 +299,26 @@ def _lancer_et_attendre(cmd):
 def _couper_lecture():
     p = _LECTURE["p"]
     if p and p.poll() is None:
+        try:
+            p.send_signal(__import__("signal").SIGCONT)   # un lecteur en pause doit pouvoir mourir
+        except Exception:
+            pass
         p.terminate()
+
+
+def _pause_lecture(pause):
+    """Met en pause (SIGSTOP) ou relance (SIGCONT) la voix de Jarvis, sans perdre où il en était."""
+    import signal
+    if pause:
+        _REPRISE.clear()
+    p = _LECTURE["p"]
+    if p and p.poll() is None:
+        try:
+            p.send_signal(signal.SIGSTOP if pause else signal.SIGCONT)
+        except Exception:
+            pass
+    if not pause:
+        _REPRISE.set()
 
 
 def _jouer(chemin, silence=True):
@@ -340,7 +367,8 @@ def parler(texte, silence=True):
     morceaux = _decouper(texte)
     if not morceaux:
         return
-    _INTERROMPU["oui"], _INTERROMPU["audio"] = False, None
+    _INTERROMPU["oui"], _INTERROMPU["audio"], _INTERROMPU["texte"] = False, None, None
+    _REPRISE.set()
     t0 = time.time()
     q = queue.Queue()
 
@@ -363,6 +391,7 @@ def parler(texte, silence=True):
                 break
             morceau, chemin = item
             try:
+                _REPRISE.wait(30)                    # s'il vérifie si tu lui parles, la suite attend
                 if not _INTERROMPU["oui"]:
                     if premier:
                         print(f"   (voix prête en {time.time() - t0:.1f}s)")
@@ -375,7 +404,8 @@ def parler(texte, silence=True):
     finally:
         arret.set()
         if veilleur:
-            veilleur.join(timeout=2)
+            veilleur.join(timeout=20)
+        _REPRISE.set()
 
 
 def preparer_ack():
@@ -501,9 +531,45 @@ def _charger_empreinte():
         _EMPREINTE = None
 
 
+def _vraie_interruption(r, source, debut):
+    """Jarvis est en pause : on enregistre ta phrase (sans sa voix par-dessus), on vérifie que c'est toi
+    et que tu dis vraiment quelque chose. Renvoie le texte si c'est une vraie interruption, sinon None."""
+    import speech_recognition as sr
+    cps = source.SAMPLE_RATE / source.CHUNK
+    morceaux, calmes, parle = [debut], 0, 0
+    fin = time.time() + 20
+    while time.time() < fin:
+        d = source.stream.read(source.CHUNK)
+        morceaux.append(d)
+        fort = _rms(d) >= r.energy_threshold
+        calmes = 0 if fort else calmes + 1
+        parle += fort
+        if calmes >= int(1.0 * cps):
+            break
+    if parle < int(0.25 * cps):
+        print("   (fausse alerte : plus rien entendu, je reprends)")
+        return None
+    audio = sr.AudioData(b"".join(morceaux), source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+    texte = _transcrire(r, audio)
+    if not texte:
+        print("   (fausse alerte : rien de compréhensible, je reprends)")
+        return None
+    if not MOTS_STOP.search(texte) and len(texte.split()) < 2:
+        print(f"   (fausse alerte : « {texte} », je reprends)")
+        return None
+    duree = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+    s = _score(audio)
+    if s is not None and s < _seuil_pour(duree) - 0.08:
+        print(f"   (« {texte} » : ce n'est pas ta voix ({s:.2f}), je reprends)")
+        return None
+    _DERNIER["audio"] = audio
+    return texte
+
+
 def _surveiller_interruption(arret):
-    """Tourne PENDANT que Jarvis parle. Si c'est TA voix qui s'élève, il se tait et te laisse la parole.
-    Sa propre voix (qui revient par le micro) est ignorée car elle ne ressemble pas à la tienne."""
+    """Tourne PENDANT que Jarvis parle. Si ça ressemble à TA voix, il se met en PAUSE et t'écoute.
+    Vraie demande -> il s'arrête et te répond. Fausse alerte (bruit, sa propre voix, autre personne) ->
+    il reprend sa phrase là où il en était."""
     import speech_recognition as sr
     r, source = _MIC["r"], _MIC["source"]
     cps = source.SAMPLE_RATE / source.CHUNK              # morceaux de son par seconde
@@ -517,7 +583,7 @@ def _surveiller_interruption(arret):
             depuis += 1
             if len(tampon) < taille or depuis < int(0.3 * cps):
                 continue                                 # on teste environ 3 fois par seconde
-            if sum(1 for d in tampon if _rms(d) >= seuil) < taille * 0.3:
+            if sum(1 for d in tampon if _rms(d) >= seuil) < taille * 0.4:
                 reussites = 0
                 continue
             depuis = 0
@@ -526,11 +592,20 @@ def _surveiller_interruption(arret):
             if DEBUG_INTERRUPTION and s is not None:
                 print(f"   [coupure ? ressemblance {s:.2f} / seuil {SEUIL_INTERRUPTION:.2f}]")
             reussites = reussites + 1 if (s is not None and s >= SEUIL_INTERRUPTION) else 0
-            if reussites >= 2 or (s is not None and s >= SEUIL_INTERRUPTION + 0.06):
-                _INTERROMPU["oui"], _INTERROMPU["audio"] = True, audio.frame_data
-                _couper_lecture()
-                return
+            if reussites >= 2 or (s is not None and s >= SEUIL_INTERRUPTION + 0.08):
+                _pause_lecture(True)
+                print("   (pause : je vérifie si tu me parles)")
+                texte = _vraie_interruption(r, source, audio.frame_data)
+                if texte:
+                    _INTERROMPU["oui"], _INTERROMPU["audio"], _INTERROMPU["texte"] = True, audio.frame_data, texte
+                    _couper_lecture()
+                    _REPRISE.set()
+                    return
+                _pause_lecture(False)                    # fausse alerte : il reprend où il en était
+                tampon.clear()
+                reussites, depuis = 0, 0
     except Exception as e:
+        _pause_lecture(False)
         print(f"[Écoute pendant la parole arrêtée : {type(e).__name__}: {e}]")
 
 
@@ -620,8 +695,8 @@ def ecouter(recognizer, source, timeout=5, limite=DUREE_MAX_PHRASE, prefixe=None
 def _ecouter_suite(recognizer, source, timeout=8, limite=DUREE_MAX_PHRASE):
     """Comme ecouter(), mais reprend ta phrase si tu viens de couper Jarvis."""
     if _INTERROMPU["oui"]:
-        pre, _INTERROMPU["oui"] = _INTERROMPU["audio"], False
-        return ecouter(recognizer, source, prefixe=pre, limite=limite)
+        pre, texte, _INTERROMPU["oui"] = _INTERROMPU["audio"], _INTERROMPU["texte"], False
+        return texte or ecouter(recognizer, source, prefixe=pre, limite=limite)
     return ecouter(recognizer, source, timeout=timeout, limite=limite)
 
 
@@ -2002,9 +2077,13 @@ def main():
         while True:
             coupe = _INTERROMPU["oui"]
             if coupe:                                  # tu as coupé Jarvis : on reprend ta phrase
-                pre, _INTERROMPU["oui"] = _INTERROMPU["audio"], False
+                pre, texte, _INTERROMPU["oui"] = _INTERROMPU["audio"], _INTERROMPU["texte"], False
                 print("   (tu m'as coupé : je t'écoute)")
-                texte = ecouter(r, source, prefixe=pre)
+                if texte and _PHRASE_PAS_FINIE.search(texte):   # ta phrase n'est pas finie : on écoute la suite
+                    suite = ecouter(r, source, timeout=ATTENTE_SUITE_LONGUE)
+                    texte = f"{texte} {suite}" if suite else texte
+                elif not texte:
+                    texte = ecouter(r, source, prefixe=pre)
             else:
                 texte = ecouter(r, source, timeout=5)
             if not texte:
