@@ -1687,10 +1687,11 @@ def web_cliquer(texte: str) -> str:
     return _web(f)
 
 
-def web_taper(texte: str, champ: str = "", valider: bool = False) -> str:
+def web_taper(texte: str, champ: str = "", valider: bool = False, secret: bool = False) -> str:
     """Tape du texte dans un champ de la page web (recherche, formulaire, connexion, message...).
     champ = étiquette ou placeholder du champ (« Rechercher », « E-mail », « Nom »...) ; vide = le champ
-    actif ou le premier champ de saisie visible. valider=True appuie sur Entrée après."""
+    actif ou le premier champ de saisie visible. valider=True appuie sur Entrée après.
+    secret=True pour un mot de passe ou un code : il n'est ni affiché ni gardé dans l'historique."""
     def f():
         page = _page()
         loc = _trouver(page, champ, champ=True) if champ else None
@@ -1719,13 +1720,60 @@ def web_taper(texte: str, champ: str = "", valider: bool = False) -> str:
             _surligner(loc)
             loc.click(timeout=8000)
             loc.fill("")
-        page.keyboard.type(texte, delay=35)          # tapé lettre par lettre : l'utilisateur le voit
+        if secret or re.search("[\U00010000-\U0010FFFF]", texte):
+            page.keyboard.insert_text(texte)         # secret / émojis : inséré d'un coup
+        else:
+            page.keyboard.type(texte, delay=35)      # tapé lettre par lettre : l'utilisateur le voit
         if valider:
             page.keyboard.press("Enter")
             time.sleep(0.8)
             page = _page()
             _attendre_page(page)
         return "Texte tapé. " + _etat_page(page)
+    return _web(f)
+
+
+_JS_CONNEXION = r"""() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 &&
+                     getComputedStyle(e).visibility !== 'hidden'; };
+  const out = { motDePasse: false, champs: [], fournisseurs: [], boutons: [] };
+  document.querySelectorAll('input').forEach(i => {
+    if (!vis(i) || ['hidden', 'submit', 'button', 'checkbox', 'radio'].includes(i.type)) return;
+    if (i.type === 'password') out.motDePasse = true;
+    const lab = (i.labels && i.labels[0] && i.labels[0].innerText) || i.placeholder || i.getAttribute('aria-label') || i.name || i.type;
+    out.champs.push(`${lab.trim()} (${i.type || 'text'})`);
+  });
+  const fourn = /google|apple|microsoft|outlook|facebook|github|gitlab|linkedin|twitter|x\.com|discord|yahoo|amazon|sso|passkey|clé d'accès|téléphone|phone/i;
+  document.querySelectorAll('a, button, [role=button], div[tabindex]').forEach(b => {
+    if (!vis(b)) return;
+    const t = (b.innerText || b.getAttribute('aria-label') || b.title || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 80) return;
+    if (/(continuer|se connecter|connexion|sign in|log ?in|continue|s'inscrire|sign up|créer un compte|create account|passkey)/i.test(t)) {
+      if (fourn.test(t)) out.fournisseurs.push(t); else out.boutons.push(t);
+    }
+  });
+  out.fournisseurs = [...new Set(out.fournisseurs)].slice(0, 12);
+  out.boutons = [...new Set(out.boutons)].slice(0, 12);
+  out.champs = [...new Set(out.champs)].slice(0, 12);
+  return out;
+}"""
+
+
+def web_options_connexion() -> str:
+    """Analyse la page web ouverte pour savoir s'il faut se connecter et COMMENT : champs (e-mail, mot de
+    passe, code...), boutons « Continuer avec Google / Apple / Microsoft... », boutons de connexion ou
+    d'inscription. À utiliser dès qu'une page demande de se connecter, puis demande à l'utilisateur quelle
+    méthode il veut et ses identifiants avec demander_utilisateur."""
+    def f():
+        page = _page()
+        o = page.evaluate(_JS_CONNEXION)
+        if not (o["motDePasse"] or o["fournisseurs"] or o["boutons"]):
+            return "Cette page ne semble pas demander de connexion. " + _etat_page(page, False)
+        return (_etat_page(page, False) + "\nConnexion détectée."
+                + (" Champ mot de passe présent." if o["motDePasse"] else "")
+                + ("\nConnexion possible avec : " + " ; ".join(o["fournisseurs"]) if o["fournisseurs"] else "")
+                + ("\nAutres boutons : " + " ; ".join(o["boutons"]) if o["boutons"] else "")
+                + ("\nChamps à remplir : " + " ; ".join(o["champs"]) if o["champs"] else ""))
     return _web(f)
 
 
@@ -1844,10 +1892,11 @@ def web_lire_a_voix_haute(depuis_debut: bool = False, blocs_max: int = 30) -> st
 
 
 # ----------------------- Demander une info à l'utilisateur ------------------
-def demander_utilisateur(question: str) -> str:
+def demander_utilisateur(question: str, secret: bool = False) -> str:
     """Pose une question à voix haute à l'utilisateur et renvoie sa réponse, SANS arrêter la tâche en cours.
     Sert pendant une démarche : informations pour remplir un formulaire, code de vérification reçu par
-    SMS ou e-mail, choix à faire, validation d'un message avant de l'envoyer, captcha à résoudre..."""
+    SMS ou e-mail, choix à faire, validation d'un message avant de l'envoyer, captcha à résoudre...
+    secret=True pour un mot de passe ou un code : la réponse n'est pas affichée dans la console."""
     parler(question)
     r, source = _MIC["r"], _MIC["source"]
     if r is None:
@@ -1858,7 +1907,10 @@ def demander_utilisateur(question: str) -> str:
     for _ in range(2):
         rep = _ecouter_suite(r, source, timeout=20)
         if rep:
-            print(f"   (réponse : {rep})")
+            print(f"   (réponse : {'••••••' if secret else rep})")
+            if secret:                           # « a b c 1 2 3 » dicté lettre par lettre -> « abc123 »
+                rep_colle = re.sub(r"(?<=\b\w) (?=\w\b)", "", rep)
+                return f"{rep} (si c'est un code ou mot de passe épelé, sans espaces : {rep_colle})"
             return rep
         parler("Je n'ai pas entendu, tu peux répéter ?")
     return "(l'utilisateur n'a pas répondu)"
@@ -2254,8 +2306,11 @@ def web_extraire_page() -> str:
 def _resume_appel(nom, kwargs):
     """Résumé court d'un appel d'outil (sans les gros contenus), pour le journal et l'historique."""
     morceaux = []
+    masquer = kwargs.get("secret") or re.search(r"passe|password|pwd|code|pin|otp", str(kwargs.get("champ", "")), re.I)
     for k, v in kwargs.items():
-        if k in ("contenu", "nouveau_texte", "ancien_texte"):
+        if k == "texte" and masquer:
+            v = "••••••"
+        elif k in ("contenu", "nouveau_texte", "ancien_texte"):
             v = f"<{len(str(v))} caractères>"
         v = str(v).replace("\n", " ")
         morceaux.append(v[:80] + ("…" if len(v) > 80 else ""))
@@ -2288,7 +2343,7 @@ _OUTILS_BRUTS = [executer_commande, lancer_en_arriere_plan, ouvrir_terminal, tap
                  quitter_jarvis, regler_volume, date_et_heure,
                  web_ouvrir, web_defiler, web_lire, web_cliquer, web_taper, web_touche, web_retour,
                  web_liens, web_extraire_page, recolter_site, web_fermer, web_lire_a_voix_haute,
-                 web_regarder, demander_utilisateur, whatsapp_ouvrir_discussion, whatsapp_lire_messages,
+                 web_regarder, web_options_connexion, demander_utilisateur, whatsapp_ouvrir_discussion, whatsapp_lire_messages,
                  whatsapp_discussions_non_lues, whatsapp_envoyer, whatsapp_envoyer_sticker]
 OUTILS = [_avec_journal(f) for f in _OUTILS_BRUTS]
 OUTILS_PAR_NOM = {f.__name__: f for f in OUTILS}
@@ -2351,6 +2406,17 @@ def _consigne():
         "demander_utilisateur puis continue. Un captcha ou une vérification « je ne suis pas un robot » : "
         "demande à l'utilisateur de le faire dans la fenêtre, puis continue. web_regarder sert à voir ce qui "
         "n'est pas du texte (images, captcha, boutons sans texte).\n"
+        "- Documentation, article, tutoriel, page d'aide : lis-la ENTIÈREMENT (web_lire tout=True, et les "
+        "pages suivantes si elle est découpée), donne un résumé clair en 3 à 5 phrases, puis demande « Tu as "
+        "des questions là-dessus ? ». S'il en pose, réponds en te basant sur CE site (relis la page ou ouvre "
+        "la section concernée avec web_cliquer), et dis-le si l'info n'y est pas.\n"
+        "- Connexion : dès qu'une page demande de se connecter ou de créer un compte, appelle "
+        "web_options_connexion, dis à l'utilisateur les méthodes proposées (Google, Apple, e-mail...) et "
+        "demande-lui laquelle avec demander_utilisateur. Puis demande les identifiants nécessaires "
+        "(demander_utilisateur, secret=True pour le mot de passe), tape-les (web_taper, secret=True pour le mot "
+        "de passe et les codes), valide, et si un code de vérification ou une double authentification est "
+        "demandé, demande-le aussi. Une fois connecté, CONTINUE la tâche de départ sans attendre. Ne répète "
+        "jamais un mot de passe à voix haute.\n"
         "- WhatsApp : whatsapp_ouvrir_discussion (lit aussi les derniers messages), whatsapp_lire_messages, "
         "whatsapp_discussions_non_lues, whatsapp_envoyer (émojis bienvenus quand ça colle au ton), "
         "whatsapp_envoyer_sticker. Pour répondre à quelqu'un : lis ses derniers messages, résume-les, propose "
@@ -2487,7 +2553,7 @@ _GROUPES_OUTILS = {
                        r"article|actualit|youtube|facebook|gmail|connecte|réserv|achète|commande", re.I),
             {"web_ouvrir", "web_defiler", "web_lire", "web_cliquer", "web_taper", "web_touche", "web_retour",
              "web_liens", "web_extraire_page", "recolter_site", "web_fermer", "web_lire_a_voix_haute",
-             "web_regarder"}),
+             "web_regarder", "web_options_connexion"}),
     "whatsapp": (re.compile(r"whats|wa\b|message|répond|écri[st]?\s+à|sticker|émoji|emoji|discussion", re.I),
                  {"whatsapp_ouvrir_discussion", "whatsapp_lire_messages", "whatsapp_discussions_non_lues",
                   "whatsapp_envoyer", "whatsapp_envoyer_sticker", "web_regarder", "web_fermer"}),
