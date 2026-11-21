@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Jarvis v5 - assistant vocal perso avec contrôle total de l'ordinateur.
-Cerveau : Gemini, avec bascule automatique sur Groq si le quota est atteint.
+Cerveau : plusieurs modèles Gemini (quotas séparés), puis Groq, avec bascule automatique et
+          historique partagé. Agent multi-étapes : terminal visible, fichiers, éditeur de code.
 Voix    : Gemini TTS (Kore) -> secours : Piper (Siwis, local) -> edge-tts -> espeak.
 
     python jarvis.py test-cle     -> teste Gemini (et affiche le temps de réponse)
-    python jarvis.py test-groq    -> teste Groq seul
+    python jarvis.py test-groq    -> teste chaque modèle Groq
+    python jarvis.py test-terminal -> ouvre le terminal de Jarvis et y tape une commande
     python jarvis.py test-voix    -> teste la voix
     python jarvis.py apprendre-voix -> Jarvis apprend TA voix (à faire une fois)
     python jarvis.py test-id      -> montre si Jarvis te reconnais (réglage du seuil)
@@ -53,8 +55,16 @@ import webbrowser
 # ----------------------------- REGLAGES ------------------------------------
 PRENOM = "Nadhir"                         # ton prénom : Jarvis t'appelle comme ça
 NOMS = ("jarvis", "jarvice", "djarvis")   # mots d'activation acceptés
-MODELE = "gemini-3.8-flash"               # cerveau principal. Si erreur 404 : change ce nom
-MODELES_GROQ = ("openai/gpt-oss-120b", "openai/gpt-oss-20b")   # cerveau de secours (le 1er disponible est utilisé)
+# Cerveaux, essayés dans l'ordre. Chaque modèle Gemini a SON PROPRE quota gratuit : quand l'un est
+# épuisé, Jarvis passe au suivant, puis à Groq. Un modèle en erreur est mis en pause puis réessayé.
+MODELES_GEMINI = ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-flash-latest",
+                  "gemini-3.1-flash-lite")
+MODELES_GROQ = ("openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b")
+REFLEXION = "low"                         # réflexion de Gemini 3 : "low" (rapide ; "minimal" est refusé par gemini-3.8-flash)
+DELAI_CERVEAU = 60                        # secondes max d'attente d'un cerveau avant de passer au suivant
+MOT_ACTIVATION_OBLIGATOIRE = False        # False = si c'est clairement TA voix, pas besoin de dire « Jarvis »
+MAX_ETAPES = 30                           # nombre max d'outils enchaînés pour UNE demande (ouvrir, créer, écrire, vérifier...)
+HISTORIQUE_ECHANGES = 12                  # nombre d'échanges gardés en mémoire (partagés entre Gemini et Groq)
 LANGUE = "fr-FR"
 
 # Contrôle de l'ordinateur
@@ -63,7 +73,11 @@ DELAI_COMMANDE = 120                      # secondes max pour une commande
 
 # Écoute
 CONVERSATION_SECONDES = 45                # après une réponse, tu peux continuer SANS redire "Jarvis" (0 = toujours dire Jarvis)
-FACTEUR_SEUIL = 1.5                       # >1 = ignore mieux les voix faibles/lointaines. Trop haut : il ne t'entend plus (essaie 1.2)
+FACTEUR_SEUIL = 1.2                       # >1 = ignore mieux les voix faibles/lointaines. Trop haut : il ne t'entend plus (essaie 1.2)
+PAUSE_FIN_PHRASE = 1.6                    # secondes de silence avant de considérer que tu as fini (avant : 1.0, trop court)
+ATTENTE_SUITE = 0.8                       # après ce silence, il écoute encore un peu si tu reprends la parole
+ATTENTE_SUITE_LONGUE = 3.0                # ... et plus longtemps si ta phrase finit par « et », « puis », « de »...
+DUREE_MAX_PHRASE = 90                     # durée max d'une demande en secondes (avant : 15 s, il te coupait)
 
 # Ta voix (reconnaissance du locuteur) et interruption
 RECONNAISSANCE_VOIX = True                # True = seule TA voix donne des ordres (d'abord : python jarvis.py apprendre-voix)
@@ -81,9 +95,9 @@ VOIX_FICHIER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voix_na
 FIN_CONVERSATION = re.compile(r"^(ok |d'accord |bon )?(merci|c'est bon|c'est tout|ça sera tout|ça suffit)( beaucoup| jarvis)*[ .!]*$")
 
 # Voix Gemini (principale)
-MODELES_TTS = ("gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts")
+MODELES_TTS = ("gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts")
 VOIX_GEMINI = "Kore"                      # voix féminines : Kore, Zephyr, Aoede, Leda, Autonoe
-STYLE_TTS = "Dis de façon naturelle et chaleureuse : "   # mets "" pour économiser du quota
+STYLE_TTS = ""                            # consigne de ton pour la voix Gemini (certains modèles la lisent à voix haute !)
 # Voix de secours 1 : Piper (locale, sans quota, sans internet)
 PIPER_MODELE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voix", "fr_FR-siwis-medium.onnx")
 # Voix de secours 2 : edge-tts (Microsoft, en ligne)
@@ -105,6 +119,8 @@ _DERNIER = {"audio": None}                     # dernier son entendu (pour véri
 _silence = None
 _ack = None            # petit "Un instant." pré-enregistré, joué pendant que le cerveau réfléchit
 _SUDO_MDP = None       # mot de passe sudo, gardé UNIQUEMENT en mémoire
+_CWD = {"d": os.path.expanduser("~")}   # dossier de travail de Jarvis (garde la position entre deux commandes)
+_JOURNAL = []          # outils appelés pendant la demande en cours (évite de refaire une action en cas de bascule)
 
 
 # =============================== CLES =======================================
@@ -135,7 +151,10 @@ def _client():
     global _client_unique
     if _client_unique is None:
         from google import genai
-        _client_unique = genai.Client(api_key=_cle_api())
+        from google.genai import types
+        # sans délai max, une requête Gemini saturée pouvait bloquer Jarvis indéfiniment
+        _client_unique = genai.Client(api_key=_cle_api(),
+                                      http_options=types.HttpOptions(timeout=DELAI_CERVEAU * 1000))
     return _client_unique
 
 
@@ -156,6 +175,7 @@ def _synth_gemini(texte):
         return None
     from google.genai import types
     config = types.GenerateContentConfig(
+        http_options=types.HttpOptions(timeout=15000),   # voix trop lente -> Piper prend le relais
         response_modalities=["AUDIO"],
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
@@ -184,7 +204,7 @@ def _synth_gemini(texte):
             break
     limite = "429" in str(erreur) or "RESOURCE_EXHAUSTED" in str(erreur)
     print(f"[Voix Gemini {'(quota atteint)' if limite else 'indisponible'} : {type(erreur).__name__}]")
-    _gemini_pause_jusqua = time.time() + (60 if limite else 10)
+    _gemini_pause_jusqua = time.time() + (600 if limite else 60)   # en attendant : voix Piper, instantanée
     return None
 
 
@@ -429,7 +449,7 @@ def _seuil_pour(duree):
 def _apprendre(emb, s, duree):
     """Affine ton empreinte avec une phrase dont on est presque sûr que c'est toi (et la sauvegarde)."""
     global _EMPREINTE
-    if not APPRENTISSAGE_CONTINU or emb is None or duree < 2.5 or s < 0.75:
+    if not APPRENTISSAGE_CONTINU or emb is None or duree < 1.5 or s < 0.70:
         return
     try:
         import numpy as np
@@ -444,7 +464,9 @@ def _apprendre(emb, s, duree):
 
 def _est_nadhir(audio, avec_nom=False):
     """True si c'est ta voix (ou si on ne peut pas juger : voix non apprise, son trop court).
-    Si tu as dit « Jarvis », on est un peu moins exigeant."""
+    Si tu as dit « Jarvis », on est un peu moins exigeant.
+    _DERNIER["sur"] = True seulement si ta voix a vraiment été reconnue (pas juste « impossible à juger »)."""
+    _DERNIER["sur"] = False
     if _EMPREINTE is None or audio is None:
         return True
     duree = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
@@ -457,6 +479,7 @@ def _est_nadhir(audio, avec_nom=False):
     ok = s >= seuil
     print(f"   (ressemblance avec ta voix : {s:.2f} / exigé : {seuil:.2f})")
     if ok:
+        _DERNIER["sur"] = True
         _apprendre(emb, s, duree)
     return ok
 
@@ -512,7 +535,7 @@ def _surveiller_interruption(arret):
 
 
 # =============================== OREILLES ===================================
-def _suite_phrase(recognizer, source, debut_audio, limite=15):
+def _suite_phrase(recognizer, source, debut_audio, limite=DUREE_MAX_PHRASE):
     """Continue d'enregistrer ta phrase déjà commencée (quand tu as coupé Jarvis), jusqu'au silence."""
     import speech_recognition as sr
     cps = source.SAMPLE_RATE / source.CHUNK
@@ -522,23 +545,42 @@ def _suite_phrase(recognizer, source, debut_audio, limite=15):
         d = source.stream.read(source.CHUNK)
         morceaux.append(d)
         calmes = calmes + 1 if _rms(d) < recognizer.energy_threshold else 0
-        if calmes >= int(0.9 * cps):
+        if calmes >= int(PAUSE_FIN_PHRASE * cps):
             break
     return sr.AudioData(b"".join(morceaux), source.SAMPLE_RATE, source.SAMPLE_WIDTH)
 
 
-def ecouter(recognizer, source, timeout=5, limite=15, prefixe=None):
-    """Écoute une phrase et renvoie le texte (ou None).
-    prefixe = début de phrase déjà enregistré (quand tu coupes Jarvis en pleine parole)."""
+# Une phrase qui se termine par un de ces mots n'est sûrement pas finie : on attend la suite.
+_PHRASE_PAS_FINIE = re.compile(
+    r"(\b(et|puis|ensuite|après|aussi|ou|mais|donc|alors|de|du|des|le|la|les|l|un|une|à|au|aux|en|dans|"
+    r"sur|sous|pour|par|avec|sans|qui|que|qu|quoi|dont|où|si|comme|mon|ma|mes|ton|ta|tes|son|sa|ses|ce|cet|"
+    r"cette|ces|euh|hum|genre|c'est|il|elle|je|tu|on|nous|vous)|,)\s*$", re.IGNORECASE)
+
+
+def _joindre(a, b):
     import speech_recognition as sr
-    if prefixe is not None:
-        audio = _suite_phrase(recognizer, source, prefixe, limite)
-    else:
+    return sr.AudioData(a.frame_data + b.frame_data, a.sample_rate, a.sample_width)
+
+
+def _prolonger(recognizer, source, audio, attente):
+    """Après une pause, écoute encore `attente` secondes : si tu reprends la parole, on recolle la suite."""
+    import speech_recognition as sr
+    recu = False
+    while True:
+        duree = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+        reste = DUREE_MAX_PHRASE - duree
+        if reste < 2:
+            return audio, recu
         try:
-            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=limite)
+            suite = recognizer.listen(source, timeout=attente, phrase_time_limit=reste)
         except sr.WaitTimeoutError:
-            return None
-    _DERNIER["audio"] = audio
+            return audio, recu
+        audio, recu = _joindre(audio, suite), True
+        print("   (tu continues : je t'écoute toujours)")
+
+
+def _transcrire(recognizer, audio):
+    import speech_recognition as sr
     try:
         return recognizer.recognize_google(audio, language=LANGUE)
     except sr.UnknownValueError:
@@ -548,7 +590,34 @@ def ecouter(recognizer, source, timeout=5, limite=15, prefixe=None):
         return None
 
 
-def _ecouter_suite(recognizer, source, timeout=8, limite=15):
+def ecouter(recognizer, source, timeout=5, limite=DUREE_MAX_PHRASE, prefixe=None):
+    """Écoute une phrase ENTIÈRE et renvoie le texte (ou None).
+    Une courte pause ne coupe pas : il attend de voir si tu continues, surtout si ta phrase
+    s'arrête sur « et », « puis », « de »...
+    prefixe = début de phrase déjà enregistré (quand tu coupes Jarvis en pleine parole)."""
+    import speech_recognition as sr
+    if prefixe is not None:
+        audio = _suite_phrase(recognizer, source, prefixe, limite)
+    else:
+        try:
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=limite)
+        except sr.WaitTimeoutError:
+            return None
+    audio, _ = _prolonger(recognizer, source, audio, ATTENTE_SUITE)
+    texte = _transcrire(recognizer, audio)
+    for _ in range(3):                    # la phrase a l'air coupée : on laisse le temps de finir
+        if not texte or not _PHRASE_PAS_FINIE.search(texte):
+            break
+        print(f"   (« {texte} »... j'attends la suite)")
+        audio, prolonge = _prolonger(recognizer, source, audio, ATTENTE_SUITE_LONGUE)
+        if not prolonge:
+            break
+        texte = _transcrire(recognizer, audio) or texte
+    _DERNIER["audio"] = audio
+    return texte
+
+
+def _ecouter_suite(recognizer, source, timeout=8, limite=DUREE_MAX_PHRASE):
     """Comme ecouter(), mais reprend ta phrase si tu viens de couper Jarvis."""
     if _INTERROMPU["oui"]:
         pre, _INTERROMPU["oui"] = _INTERROMPU["audio"], False
@@ -587,24 +656,51 @@ def _autorise(commande):
     return True
 
 
+def _chemin(chemin):
+    """Chemin absolu : ~ = dossier personnel, un chemin relatif part du dossier de travail de Jarvis."""
+    chemin = os.path.expanduser((chemin or ".").strip())
+    if chemin.startswith("file://"):
+        chemin = chemin[7:]
+    return os.path.normpath(chemin if os.path.isabs(chemin) else os.path.join(_CWD["d"], chemin))
+
+
+def _cwd_valide():
+    if not os.path.isdir(_CWD["d"]):
+        _CWD["d"] = os.path.expanduser("~")
+    return _CWD["d"]
+
+
+_MARQUE_PWD = "__JARVIS_PWD__"
+
+
 def executer_commande(commande: str) -> str:
-    """Exécute une commande shell (bash) sur l'ordinateur de l'utilisateur et renvoie sa sortie.
+    """Exécute une commande shell (bash) en arrière-plan, SANS fenêtre visible, et renvoie sa sortie.
     Sert à tout : fichiers et dossiers, installation de paquets (sudo fonctionne), infos système,
-    réseau, captures d'écran, git, scripts, etc. Attend la fin de la commande.
-    Pour lancer une application graphique, utilise plutôt ouvrir_application."""
+    réseau, git, npm, pip, scripts, etc. Attend la fin de la commande.
+    Elle s'exécute dans le dossier de travail actuel, et un « cd » est conservé pour les commandes suivantes.
+    Si l'utilisateur veut VOIR la commande dans un terminal, utilise plutôt taper_dans_terminal.
+    Pour un serveur ou un programme qui ne s'arrête pas, utilise lancer_en_arriere_plan."""
     if not _autorise(commande):
         return "REFUSÉ : l'utilisateur n'a pas confirmé cette commande."
     cmd, kw = commande, {"stdin": subprocess.DEVNULL}
     if _SUDO_MDP and _SUDO_CMD.search(commande):
         cmd = _SUDO_CMD.sub(r"\1sudo -S -p '' ", commande)
         kw = {"input": _SUDO_MDP + "\n"}
+    script = f'{cmd}\n__rc=$?\nprintf "\\n{_MARQUE_PWD}%s" "$PWD"\nexit $__rc'
     t0 = time.time()
     try:
-        p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
-                           timeout=DELAI_COMMANDE, cwd=os.path.expanduser("~"), **kw)
+        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                           timeout=DELAI_COMMANDE, cwd=_cwd_valide(), **kw)
         print(f"   [commande exécutée en {time.time() - t0:.1f}s : {commande[:70]}]")
-        sortie = (p.stdout + p.stderr).strip()
-        return f"code de retour {p.returncode}\n{sortie[:3000]}"
+        out, _, pwd = p.stdout.rpartition(_MARQUE_PWD)
+        if _ and os.path.isdir(pwd.strip()):
+            _CWD["d"] = pwd.strip()
+        else:
+            out = p.stdout
+        sortie = (out + p.stderr).strip()
+        if len(sortie) > 6000:
+            sortie = sortie[:2500] + "\n[...]\n" + sortie[-3000:]
+        return f"code de retour {p.returncode} (dossier : {_CWD['d']})\n{sortie}"
     except subprocess.TimeoutExpired:
         return (f"La commande dépasse {DELAI_COMMANDE} secondes et a été arrêtée. "
                 "Utilise lancer_en_arriere_plan si elle doit tourner longtemps.")
@@ -613,17 +709,406 @@ def executer_commande(commande: str) -> str:
 
 
 def lancer_en_arriere_plan(commande: str) -> str:
-    """Lance une commande shell en arrière-plan sans attendre sa fin (serveur, téléchargement long,
-    programme graphique). Renvoie immédiatement."""
+    """Lance une commande shell en arrière-plan sans attendre sa fin (serveur web, npm run dev,
+    téléchargement long, programme graphique). Renvoie immédiatement le chemin d'un fichier journal :
+    lis-le avec lire_fichier quelques secondes après pour vérifier que tout va bien."""
     if not _autorise(commande):
         return "REFUSÉ : l'utilisateur n'a pas confirmé cette commande."
+    journal = os.path.join(tempfile.gettempdir(), f"jarvis-fond-{int(time.time())}.log")
     try:
-        subprocess.Popen(["bash", "-c", commande], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, start_new_session=True,
-                         cwd=os.path.expanduser("~"))
-        return "Commande lancée en arrière-plan."
+        with open(journal, "w") as f:
+            p = subprocess.Popen(["bash", "-c", commande], stdout=f, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True, cwd=_cwd_valide())
+        return f"Commande lancée en arrière-plan (pid {p.pid}). Journal : {journal}"
     except Exception as e:
         return f"Erreur : {e}"
+
+
+def changer_dossier(chemin: str) -> str:
+    """Change le dossier de travail de Jarvis (comme « cd »). Les chemins relatifs, les commandes
+    et le terminal partent ensuite de ce dossier. Crée le dossier s'il n'existe pas."""
+    d = _chemin(chemin)
+    try:
+        os.makedirs(d, exist_ok=True)
+        _CWD["d"] = d
+        return f"Dossier de travail : {d}"
+    except Exception as e:
+        return f"Erreur : {e}"
+
+
+def creer_dossier(chemin: str) -> str:
+    """Crée un dossier (et les dossiers parents manquants)."""
+    d = _chemin(chemin)
+    try:
+        os.makedirs(d, exist_ok=True)
+        return f"Dossier créé : {d}"
+    except Exception as e:
+        return f"Erreur : {e}"
+
+
+_IGNORES = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".next", ".dart_tool",
+            ".idea", ".vscode", "target", ".cache"}
+
+
+def lister_dossier(chemin: str = ".", profondeur: int = 2) -> str:
+    """Liste le contenu d'un dossier sous forme d'arbre (profondeur 1 à 4). Ignore node_modules, .git, venv..."""
+    racine = _chemin(chemin)
+    if not os.path.isdir(racine):
+        return f"Ce dossier n'existe pas : {racine}"
+    lignes, prof = [racine + "/"], max(1, min(4, int(profondeur)))
+    for d, dossiers, fichiers in os.walk(racine):
+        niveau = d[len(racine):].count(os.sep)
+        dossiers[:] = sorted(x for x in dossiers if x not in _IGNORES)
+        if niveau >= prof:
+            dossiers[:] = []
+            continue
+        retrait = "  " * (niveau + 1)
+        if d != racine:
+            lignes.append("  " * niveau + os.path.basename(d) + "/")
+        lignes += [retrait + f for f in sorted(fichiers)[:60]]
+        if len(lignes) > 300:
+            lignes.append("[... liste tronquée]")
+            break
+    return "\n".join(lignes)
+
+
+def lire_fichier(chemin: str) -> str:
+    """Lit le contenu d'un fichier texte (jusqu'à 20000 caractères), avec les numéros de ligne.
+    ~ désigne le dossier personnel ; un chemin relatif part du dossier de travail."""
+    try:
+        with open(_chemin(chemin), encoding="utf-8", errors="replace") as f:
+            texte = f.read(20001)
+        lignes = texte[:20000].split("\n")
+        corps = "\n".join(f"{i:4} | {l}" for i, l in enumerate(lignes, 1))
+        return corps + ("\n[... fichier tronqué à 20000 caractères]" if len(texte) > 20000 else "")
+    except Exception as e:
+        return f"Erreur : {e}"
+
+
+def ecrire_fichier(chemin: str, contenu: str, ajouter: bool = False) -> str:
+    """Écrit un fichier COMPLET (ou ajoute à la fin si ajouter=True). Crée les dossiers manquants.
+    Utilise-le pour créer des fichiers de code, des pages web (HTML, CSS, JS), des scripts, etc.
+    Pour changer seulement un passage d'un fichier existant, utilise plutôt modifier_fichier."""
+    chemin = _chemin(chemin)
+    if CONFIRMER_ACTIONS_SENSIBLES and os.path.exists(chemin) and not ajouter:
+        if not _confirmer(f"Le fichier {os.path.basename(chemin)} existe déjà. Je l'écrase ?"):
+            return "REFUSÉ : l'utilisateur n'a pas confirmé l'écrasement."
+    try:
+        dossier = os.path.dirname(chemin)
+        if dossier:
+            os.makedirs(dossier, exist_ok=True)
+        with open(chemin, "a" if ajouter else "w", encoding="utf-8") as f:
+            f.write(contenu)
+        return f"Fichier écrit : {chemin} ({len(contenu)} caractères)"
+    except Exception as e:
+        return f"Erreur : {e}"
+
+
+def modifier_fichier(chemin: str, ancien_texte: str, nouveau_texte: str) -> str:
+    """Remplace dans un fichier un passage exact (ancien_texte, copié tel quel depuis lire_fichier,
+    SANS les numéros de ligne) par nouveau_texte. Sert à corriger un bug ou modifier du code
+    sans réécrire tout le fichier. L'éditeur de code ouvert se met à jour tout seul."""
+    chemin = _chemin(chemin)
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            texte = f.read()
+    except Exception as e:
+        return f"Erreur : {e}"
+    n = texte.count(ancien_texte)
+    if n == 0:
+        return ("Passage introuvable : relis le fichier avec lire_fichier et copie le texte exact "
+                "(espaces et indentation compris, sans les numéros de ligne).")
+    if n > 1:
+        return f"Ce passage apparaît {n} fois : donne un passage plus long pour qu'il soit unique."
+    try:
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(texte.replace(ancien_texte, nouveau_texte, 1))
+        return f"Fichier modifié : {chemin}"
+    except Exception as e:
+        return f"Erreur : {e}"
+
+
+def verifier_code(chemin: str) -> str:
+    """Vérifie un fichier de code (ou tous ceux d'un dossier) : erreurs de syntaxe et problèmes
+    détectables automatiquement (Python, JavaScript, TypeScript, shell, JSON, PHP, Dart).
+    Après ça, lis aussi le code avec lire_fichier pour juger la logique."""
+    cible = _chemin(chemin)
+    if os.path.isdir(cible):
+        fichiers = []
+        for d, dossiers, noms in os.walk(cible):
+            dossiers[:] = [x for x in dossiers if x not in _IGNORES]
+            fichiers += [os.path.join(d, n) for n in noms]
+        fichiers = [f for f in fichiers if os.path.splitext(f)[1] in _VERIFS][:40]
+        if not fichiers:
+            return "Aucun fichier de code que je sais vérifier automatiquement dans ce dossier."
+        return "\n\n".join(_verifier_un(f) for f in fichiers)
+    if not os.path.exists(cible):
+        return f"Fichier introuvable : {cible}"
+    return _verifier_un(cible)
+
+
+def _verif_json(f):
+    try:
+        with open(f, encoding="utf-8") as h:
+            json.load(h)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+_VERIFS = {
+    ".py": [["python3", "-m", "py_compile"], ["python3", "-m", "pyflakes"], ["ruff", "check", "--quiet"]],
+    ".js": [["node", "--check"]], ".mjs": [["node", "--check"]], ".cjs": [["node", "--check"]],
+    ".ts": [["npx", "--no-install", "tsc", "--noEmit", "--skipLibCheck"]],
+    ".sh": [["bash", "-n"]], ".php": [["php", "-l"]], ".dart": [["dart", "analyze"]],
+    ".json": _verif_json, ".html": None, ".css": None,
+}
+
+
+def _verifier_un(fichier):
+    regles = _VERIFS.get(os.path.splitext(fichier)[1])
+    nom = os.path.relpath(fichier, _CWD["d"])
+    if regles is None:
+        return f"{nom} : pas de vérificateur automatique, lis le fichier pour le relire toi-même."
+    if callable(regles):
+        err = regles(fichier)
+        return f"{nom} : {'OK' if not err else 'ERREUR ' + err}"
+    resultats = []
+    for cmd in regles:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            p = subprocess.run(cmd + [fichier], capture_output=True, text=True, timeout=60,
+                               cwd=os.path.dirname(fichier))
+        except Exception as e:
+            resultats.append(f"{cmd[0]} : impossible ({e})")
+            continue
+        sortie = (p.stdout + p.stderr).strip()
+        if "No module named" in sortie:
+            continue                                   # outil non installé (pyflakes...) : on passe
+        resultats.append(f"{' '.join(cmd[:3])} : " + ("OK" if p.returncode == 0 and not sortie
+                                                        else sortie[:1500]))
+    return f"{nom} :\n  " + ("\n  ".join(resultats) if resultats else "aucun outil de vérification installé")
+
+
+# ----------------------- Terminal visible piloté par Jarvis ------------------
+# Une vraie fenêtre de terminal s'ouvre ; Jarvis y « tape » les commandes (elles s'affichent et
+# s'exécutent sous tes yeux) et lit leur résultat. Aucun outil de clavier virtuel n'est nécessaire,
+# donc ça marche aussi sous Wayland.
+_SCRIPT_TERMINAL = r'''
+fifo="$1"; log="$2"; cd "$3" 2>/dev/null || cd ~
+echo $$ > "$fifo.pid"
+printf '\033]0;Terminal de Jarvis\007'
+echo "=== Terminal de Jarvis : les commandes que tu me demandes s'exécutent ici ==="
+exec 3<>"$fifo"
+tail -n0 -F "$log" 2>/dev/null | grep --line-buffered -v '^__JARVIS_FIN__' &
+while IFS= read -r ligne <&3; do
+  id="${ligne%%:*}"; mode="${ligne#*:}"; mode="${mode%%:*}"; b64="${ligne#*:*:}"
+  cmd="$(printf '%s' "$b64" | base64 -d)"
+  printf '\n\033[1;32m%s\033[0m$ %s\n' "$PWD" "$cmd" >> "$log"
+  if [ "$mode" = "i" ]; then sleep 0.3; eval "$cmd"; else eval "$cmd" >> "$log" 2>&1 < /dev/tty; fi
+  echo "__JARVIS_FIN__ $id $? $PWD" >> "$log"
+done
+'''
+
+
+def _fichiers_terminal():
+    d = os.path.join(tempfile.gettempdir(), f"jarvis-terminal-{os.getuid()}")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "commandes.fifo"), os.path.join(d, "sortie.log"), os.path.join(d, "terminal.sh")
+
+
+def _ouvrir_fifo():
+    """Renvoie un descripteur d'écriture vers le terminal de Jarvis, ou None s'il n'est pas ouvert."""
+    fifo = _fichiers_terminal()[0]
+    if not os.path.exists(fifo):
+        return None
+    try:
+        return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+
+
+def _commande_terminal(script, args, dossier):
+    """Commande pour ouvrir une fenêtre de terminal qui exécute `bash script args`."""
+    interne = ["bash", script] + args
+    for prog, avant in (("ptyxis", ["--new-window", "-d", dossier, "--"]),
+                        ("gnome-terminal", ["--window", f"--working-directory={dossier}", "--"]),
+                        ("kgx", ["--"]), ("konsole", ["-e"]), ("xfce4-terminal", ["-x"]),
+                        ("tilix", ["-e"]), ("alacritty", ["-e"]), ("kitty", []),
+                        ("xterm", ["-e"]), ("x-terminal-emulator", ["-e"])):
+        if shutil.which(prog):
+            return [prog] + avant + interne
+    return None
+
+
+def ouvrir_terminal(dossier: str = "") -> str:
+    """Ouvre une fenêtre de terminal VISIBLE contrôlée par Jarvis (dans le dossier donné, sinon le
+    dossier de travail). Ensuite, utilise taper_dans_terminal pour y taper et exécuter des commandes.
+    À utiliser quand l'utilisateur dit « ouvre le terminal » (et éventuellement « tape ... »)."""
+    if dossier:
+        changer_dossier(dossier)
+    fd = _ouvrir_fifo()
+    if fd is not None:
+        os.close(fd)
+        if dossier:
+            return taper_dans_terminal(f"cd {shlex.quote(_CWD['d'])}", 5)
+        return "Le terminal de Jarvis est déjà ouvert."
+    fifo, log, script = _fichiers_terminal()
+    if os.path.exists(fifo):
+        os.remove(fifo)
+    os.mkfifo(fifo, 0o600)
+    with open(log, "w"):
+        pass
+    with open(script, "w") as f:
+        f.write(_SCRIPT_TERMINAL)
+    cmd = _commande_terminal(script, [fifo, log, _cwd_valide()], _CWD["d"])
+    if not cmd:
+        return "Aucun terminal graphique trouvé (installe gnome-terminal ou ptyxis)."
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(50):                        # on attend que la fenêtre soit prête (5 s max)
+        time.sleep(0.1)
+        fd = _ouvrir_fifo()
+        if fd is not None:
+            os.close(fd)
+            return f"Terminal ouvert dans {_CWD['d']}."
+    return "J'ai lancé le terminal mais il ne répond pas."
+
+
+def taper_dans_terminal(commande: str, attendre: int = 30, interactif: bool = False) -> str:
+    """Tape et exécute une commande dans le terminal VISIBLE de Jarvis (l'ouvre si besoin), puis
+    renvoie ce qu'elle affiche. Le « cd » est conservé d'une commande à l'autre.
+    attendre = secondes max d'attente du résultat (la commande continue si elle est plus longue).
+    interactif=True pour un programme plein écran ou qui pose des questions (nano, htop, ssh, python...) :
+    l'utilisateur le voit et peut l'utiliser lui-même, mais tu ne lis pas sa sortie."""
+    if not _autorise(commande):
+        return "REFUSÉ : l'utilisateur n'a pas confirmé cette commande."
+    fd = _ouvrir_fifo()
+    if fd is None:
+        r = ouvrir_terminal()
+        fd = _ouvrir_fifo()
+        if fd is None:
+            return r
+    import base64
+    fifo, log, _ = _fichiers_terminal()
+    ident = f"{time.time():.6f}".replace(".", "")
+    debut = os.path.getsize(log)
+    ligne = f"{ident}:{'i' if interactif else 'n'}:{base64.b64encode(commande.encode()).decode()}\n"
+    try:
+        os.write(fd, ligne.encode())
+    finally:
+        os.close(fd)
+    print(f"   [tapé dans le terminal : {commande[:70]}]")
+    if interactif:
+        return "Commande lancée dans le terminal (mode interactif : l'utilisateur la voit et l'utilise)."
+    fin_attente = time.time() + max(1, min(int(attendre), DELAI_COMMANDE))
+    marque = f"__JARVIS_FIN__ {ident} "
+    while time.time() < fin_attente:
+        time.sleep(0.2)
+        with open(log, encoding="utf-8", errors="replace") as f:
+            f.seek(debut)
+            texte = f.read()
+        if marque in texte:
+            sortie, _, reste = texte.partition(marque)
+            code, _, pwd = reste.split("\n", 1)[0].partition(" ")
+            if os.path.isdir(pwd.strip()):
+                _CWD["d"] = pwd.strip()
+            sortie = re.sub(r"\x1b\[[0-9;]*m", "", sortie).strip()
+            sortie = "\n".join(sortie.split("\n")[1:])          # sans la ligne « dossier$ commande »
+            if len(sortie) > 6000:
+                sortie = sortie[:2500] + "\n[...]\n" + sortie[-3000:]
+            return f"code de retour {code} (dossier : {_CWD['d']})\n{sortie}"
+    return ("La commande tourne toujours dans le terminal (visible par l'utilisateur). "
+            "Ne la relance pas ; elle continue toute seule.")
+
+
+# ----------------------------- Éditeurs de code -----------------------------
+_EDITEURS = (  # (noms possibles, commandes, dossier de configuration)
+    (("devin", "windsurf"), ("windsurf", "devin-desktop", "/usr/share/devin-desktop/devin-desktop"),
+     ("Devin", "Windsurf")),
+    (("vscode", "vs code", "visual studio code", "code"), ("code", "/snap/bin/code"), ("Code",)),
+    (("cursor",), ("cursor",), ("Cursor",)),
+    (("vscodium", "codium"), ("codium",), ("VSCodium",)),
+)
+
+
+def ouvrir_dans_editeur(chemin: str, editeur: str = "") -> str:
+    """Ouvre un fichier ou un dossier de projet dans l'éditeur de code (Devin/Windsurf, VS Code,
+    Cursor). editeur = nom de l'éditeur voulu, vide = celui qui est installé."""
+    cible = _chemin(chemin)
+    if not os.path.exists(cible):
+        return f"Ce chemin n'existe pas : {cible}"
+    voulu = editeur.lower().strip()
+    candidats = [e for e in _EDITEURS if not voulu or any(n in voulu or voulu in n for n in e[0])] or _EDITEURS
+    for _, commandes, _ in candidats:
+        for c in commandes:
+            exe = shutil.which(c) or (c if os.path.isabs(c) and os.path.exists(c) else None)
+            if exe:
+                subprocess.Popen([exe, cible], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+                if os.path.isdir(cible):
+                    _CWD["d"] = cible
+                return f"Ouvert dans l'éditeur ({os.path.basename(exe)}) : {cible}"
+    return "Aucun éditeur de code trouvé (Devin, Windsurf, VS Code, Cursor)."
+
+
+def _fichiers_recents(dossier, n=6):
+    trouves = []
+    for d, dossiers, noms in os.walk(dossier):
+        dossiers[:] = [x for x in dossiers if x not in _IGNORES and not x.startswith(".")]
+        for nom in noms:
+            p = os.path.join(d, nom)
+            try:
+                trouves.append((os.path.getmtime(p), p))
+            except OSError:
+                pass
+        if len(trouves) > 5000:
+            break
+    return [p for _, p in sorted(trouves, reverse=True)[:n]]
+
+
+def contexte_editeur() -> str:
+    """Dit quel projet est ouvert dans l'éditeur de code (Devin/Windsurf, VS Code, Cursor), les derniers
+    fichiers ouverts dedans et les derniers fichiers modifiés. À utiliser quand l'utilisateur parle de
+    « mon code », « ce fichier », « le projet » sans donner de chemin."""
+    import sqlite3
+    import urllib.parse
+    espaces = []
+    for _, _, configs in _EDITEURS:
+        for nom in configs:
+            base = os.path.expanduser(f"~/.config/{nom}/User/workspaceStorage")
+            for d in glob.glob(os.path.join(base, "*")):
+                ws, db = os.path.join(d, "workspace.json"), os.path.join(d, "state.vscdb")
+                if os.path.exists(ws) and os.path.exists(db):
+                    espaces.append((os.path.getmtime(db), nom, ws, db))
+    if not espaces:
+        return "Je ne trouve aucun projet ouvert dans un éditeur de code."
+    lignes = []
+    for _, nom, ws, db in sorted(espaces, reverse=True)[:2]:
+        try:
+            with open(ws) as f:
+                info = json.load(f)
+            dossier = urllib.parse.unquote(urllib.parse.urlparse(info.get("folder") or info.get("workspace", "")).path)
+        except Exception:
+            continue
+        ouverts = []
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            ligne = con.execute("select value from ItemTable where key='history.entries'").fetchone()
+            con.close()
+            for e in json.loads(ligne[0]) if ligne else []:
+                res = (e.get("editor") or {}).get("resource", "")
+                if res.startswith("file://"):
+                    ouverts.append(urllib.parse.unquote(res[7:]))
+        except Exception:
+            pass
+        lignes.append(f"Éditeur {nom} - projet : {dossier}")
+        if ouverts:
+            lignes.append("  derniers fichiers ouverts (le 1er est le plus récent) : " + ", ".join(ouverts[:6]))
+        if os.path.isdir(dossier):
+            lignes.append("  derniers fichiers modifiés : " + ", ".join(_fichiers_recents(dossier)))
+    return "\n".join(lignes) or "Je ne trouve aucun projet ouvert dans un éditeur de code."
 
 
 def _dossiers_applications():
@@ -687,7 +1172,10 @@ def _trouver_application(nom, dossiers=None):
 
 def ouvrir_application(nom: str) -> str:
     """Ouvre une application installée sur l'ordinateur à partir de son nom
-    (ex : Firefox, Chrome, calculatrice, Spotify, VLC, Visual Studio Code, terminal, fichiers)."""
+    (ex : Firefox, Chrome, calculatrice, Spotify, VLC, fichiers, paramètres).
+    Pour un terminal, utilise ouvrir_terminal ; pour un éditeur de code, ouvrir_dans_editeur."""
+    if re.search(r"\b(terminal|console|shell|ptyxis)\b", nom.lower()):
+        return ouvrir_terminal()
     exec_ = _trouver_application(nom)
     try:
         if exec_:
@@ -705,9 +1193,11 @@ def ouvrir_application(nom: str) -> str:
 
 
 def ouvrir_url(url: str) -> str:
-    """Ouvre une adresse web (site, page, vidéo) dans le navigateur par défaut."""
+    """Ouvre une adresse web (site, page, vidéo) ou un fichier local (ex : index.html d'un site
+    que tu viens de créer) dans le navigateur par défaut."""
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
-        url = "https://" + url
+        local = _chemin(url)
+        url = ("file://" + local) if os.path.exists(local) else "https://" + url
     webbrowser.open(url)
     return f"Adresse ouverte : {url}"
 
@@ -717,32 +1207,6 @@ def chercher_sur_internet(requete: str) -> str:
     import urllib.parse
     webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote(requete))
     return f"Recherche lancée : {requete}"
-
-
-def lire_fichier(chemin: str) -> str:
-    """Lit le contenu d'un fichier texte (jusqu'à 5000 caractères). ~ désigne le dossier personnel."""
-    try:
-        with open(os.path.expanduser(chemin), encoding="utf-8", errors="replace") as f:
-            return f.read(5000)
-    except Exception as e:
-        return f"Erreur : {e}"
-
-
-def ecrire_fichier(chemin: str, contenu: str, ajouter: bool = False) -> str:
-    """Écrit (ou ajoute à la fin si ajouter=True) du texte dans un fichier. Crée les dossiers manquants."""
-    chemin = os.path.expanduser(chemin)
-    if CONFIRMER_ACTIONS_SENSIBLES and os.path.exists(chemin) and not ajouter:
-        if not _confirmer(f"Le fichier {os.path.basename(chemin)} existe déjà. Je l'écrase ?"):
-            return "REFUSÉ : l'utilisateur n'a pas confirmé l'écrasement."
-    try:
-        dossier = os.path.dirname(chemin)
-        if dossier:
-            os.makedirs(dossier, exist_ok=True)
-        with open(chemin, "a" if ajouter else "w", encoding="utf-8") as f:
-            f.write(contenu)
-        return f"Fichier écrit : {chemin}"
-    except Exception as e:
-        return f"Erreur : {e}"
 
 
 def regler_volume(pourcentage: int) -> str:
@@ -764,8 +1228,41 @@ def date_et_heure() -> str:
     return f"{jours[n.weekday()]} {n.strftime('%d/%m/%Y')}, {n.strftime('%H:%M')}"
 
 
-OUTILS = [executer_commande, lancer_en_arriere_plan, ouvrir_application, ouvrir_url,
-          chercher_sur_internet, lire_fichier, ecrire_fichier, regler_volume, date_et_heure]
+def _resume_appel(nom, kwargs):
+    """Résumé court d'un appel d'outil (sans les gros contenus), pour le journal et l'historique."""
+    morceaux = []
+    for k, v in kwargs.items():
+        if k in ("contenu", "nouveau_texte", "ancien_texte"):
+            v = f"<{len(str(v))} caractères>"
+        v = str(v).replace("\n", " ")
+        morceaux.append(v[:80] + ("…" if len(v) > 80 else ""))
+    return f"{nom}({', '.join(morceaux)})"
+
+
+def _avec_journal(fn):
+    """Enregistre chaque appel d'outil dans _JOURNAL (et l'affiche), sans changer la signature."""
+    import functools
+
+    @functools.wraps(fn)
+    def outil(*args, **kwargs):
+        noms = list(inspect.signature(fn).parameters)
+        kwargs.update(zip(noms, args))
+        resume = _resume_appel(fn.__name__, kwargs)
+        print(f"   -> {resume}")
+        try:
+            resultat = fn(**kwargs)
+        except Exception as e:
+            resultat = f"Erreur : {type(e).__name__}: {e}"
+        _JOURNAL.append(resume)
+        return resultat
+    return outil
+
+
+_OUTILS_BRUTS = [executer_commande, lancer_en_arriere_plan, ouvrir_terminal, taper_dans_terminal,
+                 ouvrir_application, ouvrir_dans_editeur, contexte_editeur, ouvrir_url, chercher_sur_internet,
+                 changer_dossier, creer_dossier, lister_dossier, lire_fichier, ecrire_fichier,
+                 modifier_fichier, verifier_code, regler_volume, date_et_heure]
+OUTILS = [_avec_journal(f) for f in _OUTILS_BRUTS]
 OUTILS_PAR_NOM = {f.__name__: f for f in OUTILS}
 
 
@@ -793,26 +1290,46 @@ def _consigne():
         systeme = platform.freedesktop_os_release().get("PRETTY_NAME", "Linux")
     except Exception:
         systeme = "Linux"
+    bureau = f"{os.environ.get('XDG_CURRENT_DESKTOP', '?')} / {os.environ.get('XDG_SESSION_TYPE', '?')}"
     securite = ("les commandes sensibles déclenchent déjà une confirmation vocale"
                 if CONFIRMER_ACTIONS_SENSIBLES else
                 "l'utilisateur t'autorise à tout faire sur cet ordinateur, sans limite")
     return (
         f"Tu es Jarvis, l'assistant vocal personnel de {PRENOM}. Tu tournes sur son ordinateur "
-        f"({systeme}, dossier personnel {os.path.expanduser('~')}). "
-        "Tu contrôles cet ordinateur grâce à tes outils (commandes shell, applications, navigateur, "
-        "fichiers, volume). Quand on te demande de faire quelque chose, fais-le immédiatement et "
-        f"directement avec les outils, sans demander la permission : {securite}. "
-        "Sois efficace : un seul appel d'outil quand c'est possible, sans vérifications inutiles. "
-        "Si une commande échoue, lis l'erreur et essaie une autre méthode. "
-        "Ne dis jamais que tu as fait quelque chose sans avoir appelé l'outil. "
-        "Tu ne peux pas cliquer ni taper dans les fenêtres d'autres programmes : dis-le honnêtement. "
+        f"({systeme}, bureau {bureau}, dossier personnel {os.path.expanduser('~')}). "
+        "Tu es un AGENT : tu contrôles cet ordinateur grâce à tes outils et tu vas au bout des demandes. "
+        f"Quand on te demande de faire quelque chose, fais-le immédiatement, sans demander la permission : {securite}.\n"
+        "RÈGLES D'ACTION :\n"
+        "- Une demande peut contenir plusieurs étapes (« ouvre le terminal et tape ls », « crée un dossier "
+        "puis fais-moi un site dedans », « ouvre mon projet et vérifie le code »). Enchaîne TOUS les outils "
+        "nécessaires, dans l'ordre, jusqu'à ce que TOUT soit fait. Ne t'arrête jamais après la première étape.\n"
+        "- Si un outil échoue, lis l'erreur et essaie une autre méthode avant d'abandonner.\n"
+        "- Ne dis jamais que tu as fait quelque chose sans avoir appelé l'outil correspondant.\n"
+        "- Terminal : « ouvre le terminal » = ouvrir_terminal ; « tape / lance / exécute X dans le terminal » = "
+        "taper_dans_terminal (la commande s'affiche et s'exécute dans la fenêtre visible). Pour ton travail "
+        "interne (créer, installer, vérifier) sans que l'utilisateur ait demandé à voir, utilise executer_commande.\n"
+        "- Tu ne peux pas cliquer ni taper au clavier dans les fenêtres graphiques des autres programmes. "
+        "Pour agir dans un éditeur de code (Devin, Windsurf, VS Code), modifie directement les fichiers avec "
+        "ecrire_fichier / modifier_fichier : l'éditeur se met à jour tout seul.\n"
+        "- Code : si l'utilisateur parle de « mon code », « ce fichier », « le projet » sans chemin, appelle "
+        "d'abord contexte_editeur pour savoir ce qui est ouvert. « Vérifie le code » = lire_fichier + "
+        "verifier_code, puis donne les problèmes trouvés. « Corrige » = corrige avec modifier_fichier puis "
+        "revérifie.\n"
+        "- Créer un site ou un programme : crée le dossier (creer_dossier ou changer_dossier), écris chaque "
+        "fichier en entier avec ecrire_fichier (code complet, propre, moderne, qui fonctionne : pas de "
+        "« à compléter »), vérifie-le, puis ouvre le résultat (ouvrir_url sur le index.html, ou "
+        "ouvrir_dans_editeur si on te le demande).\n"
+        "- Les chemins relatifs partent du dossier de travail actuel (indiqué au début de chaque message).\n"
         "Tu réponds aussi à toutes les questions (culture, conseils, calculs, traductions...). "
         f"Tu l'appelles {PRENOM}, mais seulement de temps en temps, pas à chaque phrase. "
         "S'il te coupe ou te corrige pendant que tu parles, oublie ce que tu disais et fais tout de suite "
-        "ce qu'il demande, sans t'excuser longuement. "
+        "ce qu'il demande, sans t'excuser longuement.\n"
         "Tes réponses sont lues à voix haute : français naturel et chaleureux, 1 à 2 phrases COURTES "
-        "(après une action, juste « C'est fait » ou une phrase très brève), sans markdown, sans listes, "
-        "sans emojis, sans lire d'adresses web ni de longs chemins."
+        "(après une action, dis TOUJOURS clairement que c'est fait et ce que tu as fait, par exemple « C'est fait, "
+        "j'ai ouvert le terminal et lancé la commande » ou « Voilà, le dossier et le site sont créés » ; si "
+        "quelque chose a échoué, dis-le franchement ; après une vérification de code, "
+        "au plus 4 phrases avec l'essentiel), sans markdown, sans listes, sans emojis, sans lire de code, "
+        "d'adresses web ni de longs chemins."
     )
 
 
@@ -821,39 +1338,63 @@ class Reponse:
         self.text = text
 
 
+class Indisponible(Exception):
+    """Le cerveau n'a pas pu répondre (quota, modèle inexistant, réseau...)."""
+
+
+def _contenus_gemini(historique):
+    from google.genai import types
+    contenus = []
+    for u, a in historique:
+        contenus.append(types.Content(role="user", parts=[types.Part(text=u)]))
+        contenus.append(types.Content(role="model", parts=[types.Part(text=a)]))
+    return contenus
+
+
 class Discussion:
-    """Conversation avec Gemini, avec réflexion réduite pour répondre vite.
-    Si le modèle refuse ce réglage, on le retire automatiquement et on réessaie."""
+    """Un modèle Gemini. Chaque demande repart de l'historique commun (texte + résumé des actions),
+    ce qui permet de passer d'un modèle à l'autre sans perdre le fil, et limite les tokens consommés."""
 
-    def __init__(self):
-        self.reduite = True
-        self.chat = self._creer()
+    def __init__(self, modele):
+        self.modele = modele
+        self.reflexion = True
 
-    def _creer(self):
+    def _config(self):
         from google.genai import types
-        kw = dict(system_instruction=_consigne(), tools=OUTILS)
-        if self.reduite:
+        kw = dict(system_instruction=_consigne(), tools=OUTILS,
+                  automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                      maximum_remote_calls=MAX_ETAPES))
+        if self.reflexion:
             try:
-                if "2.5" in MODELE:
-                    kw["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                if "2.5" in self.modele:
+                    kw["thinking_config"] = types.ThinkingConfig(
+                        thinking_budget=0 if REFLEXION == "minimal" else 1024)
                 else:
-                    niveau = getattr(getattr(types, "ThinkingLevel", None), "MINIMAL", "minimal")
-                    kw["thinking_config"] = types.ThinkingConfig(thinking_level=niveau)
+                    kw["thinking_config"] = types.ThinkingConfig(thinking_level=REFLEXION)
             except Exception:
                 pass
-        return _client().chats.create(model=MODELE, config=types.GenerateContentConfig(**kw))
+        return types.GenerateContentConfig(**kw)
 
-    def send_message(self, texte):
-        try:
-            return self.chat.send_message(texte)
-        except Exception as e:
-            s = str(e).lower()
-            if self.reduite and ("thinking" in s or "budget" in s or "level" in s):
-                print("[Réglage de réflexion rapide refusé par ce modèle : désactivé]")
-                self.reduite = False
-                self.chat = self._creer()
-                return self.chat.send_message(texte)
-            raise
+    def send_message(self, texte, historique):
+        for _ in range(2):
+            chat = _client().chats.create(model=self.modele, config=self._config(),
+                                          history=_contenus_gemini(historique))
+            try:
+                rep = chat.send_message(texte)
+            except Exception as e:
+                s = str(e).lower()
+                if self.reflexion and ("thinking" in s or "budget" in s or "level" in s) and "400" in s:
+                    print(f"[{self.modele} refuse le réglage de réflexion : désactivé]")
+                    self.reflexion = False
+                    continue
+                raise
+            try:
+                texte_rep = rep.text
+            except Exception:
+                texte_rep = None
+            if not texte_rep and _JOURNAL and len(_JOURNAL) >= MAX_ETAPES:
+                texte_rep = "J'ai fait beaucoup d'étapes, dis-moi si je dois continuer."
+            return Reponse((texte_rep or "C'est fait.").strip())
 
 
 # ---------------------------- Cerveau de secours : Groq ----------------------
@@ -873,147 +1414,215 @@ def _schema_outil(fn):
 
 
 class GroqErreur(Exception):
-    pass
+    def __init__(self, message, code=0, attente=None):
+        super().__init__(message)
+        self.code, self.attente = code, attente
 
 
 class GroqChat:
-    """Même rôle que Discussion, mais avec Groq (API compatible OpenAI, via 'requests')."""
+    """Un modèle Groq (API compatible OpenAI), avec le même historique commun que Gemini."""
     URL = "https://api.groq.com/openai/v1/chat/completions"
 
-    def __init__(self):
+    def __init__(self, modele):
+        self.modele = modele
         self.cle = _lire_cle("GROQ_API_KEY")
-        self.messages = [{"role": "system", "content": _consigne()}]
-        self.modele_ok = None
         self.outils = [_schema_outil(f) for f in OUTILS]
 
     def disponible(self):
         return bool(self.cle)
 
-    def noter(self, utilisateur, assistant):
-        """Garde en mémoire un échange déjà traité par Gemini, pour que Groq suive la conversation."""
-        if self.cle and assistant:
-            self.messages += [{"role": "user", "content": utilisateur},
-                              {"role": "assistant", "content": assistant}]
-            self._tailler()
-
-    def _tailler(self, garder=8):
-        """Ne garde que les derniers échanges (le palier gratuit limite les tokens par minute)."""
-        idx = [i for i, m in enumerate(self.messages) if m["role"] == "user"]
-        if len(idx) > garder:
-            self.messages = self.messages[:1] + self.messages[idx[-garder]:]
-
-    def _requete(self):
+    def _requete(self, messages, max_tokens=8000):
         import requests
-        ordre = list(MODELES_GROQ)
-        if self.modele_ok in ordre:
-            ordre.remove(self.modele_ok)
-            ordre.insert(0, self.modele_ok)
-        derniere = None
-        for modele in ordre:
-            for essai in range(2):
-                r = requests.post(
-                    self.URL, timeout=60,
-                    headers={"Authorization": f"Bearer {self.cle}", "Content-Type": "application/json"},
-                    json={"model": modele, "messages": self.messages, "tools": self.outils,
-                          "tool_choice": "auto", "temperature": 0.5, "max_tokens": 500})
-                if r.status_code == 200:
-                    self.modele_ok = modele
-                    return r.json()
-                derniere = GroqErreur(f"Groq {r.status_code} : {r.text[:200]}")
-                if r.status_code == 400 and "tool_use_failed" in r.text and essai == 0:
-                    continue                      # le modèle a mal formé l'appel d'outil : on réessaie
-                break
-            if r.status_code in (404, 429) or "decommissioned" in r.text or "model_not_found" in r.text:
-                continue                          # modèle indisponible ou limite atteinte : on essaie le suivant
-            raise derniere
-        raise derniere
+        for essai in range(3):
+            r = requests.post(
+                self.URL, timeout=120,
+                headers={"Authorization": f"Bearer {self.cle}", "Content-Type": "application/json"},
+                json={"model": self.modele, "messages": messages, "tools": self.outils,
+                      "tool_choice": "auto", "temperature": 0.4, "max_tokens": max_tokens})
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 400 and "tool_use_failed" in r.text and essai < 2:
+                continue                      # appel d'outil mal formé par le modèle : on réessaie
+            try:
+                attente = float(r.headers.get("retry-after", ""))
+            except ValueError:
+                m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", r.text)
+                attente = (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else None
+            if r.status_code == 429 and attente is not None and attente <= 20 and essai < 2:
+                print(f"   (Groq demande d'attendre {attente:.0f} s : j'attends)")
+                time.sleep(attente + 0.5)     # limite par minute : on patiente au lieu d'abandonner
+                continue
+            if r.status_code == 413 and max_tokens > 2000 and essai < 2:
+                max_tokens //= 2
+                continue
+            raise GroqErreur(f"Groq {r.status_code} : {r.text[:300]}", r.status_code, attente)
+        raise GroqErreur("Groq : échec après plusieurs essais", 500)
 
-    def send_message(self, texte):
-        debut = len(self.messages)
-        self.messages.append({"role": "user", "content": texte})
-        try:
-            for _ in range(8):
-                msg = self._requete()["choices"][0]["message"]
-                appels = msg.get("tool_calls")
-                if not appels:
-                    rep = (msg.get("content") or "").strip() or "C'est fait."
-                    self.messages.append({"role": "assistant", "content": rep})
-                    self._tailler()
-                    return Reponse(rep)
-                self.messages.append({"role": "assistant", "content": msg.get("content") or "",
-                                      "tool_calls": appels})
-                for a in appels:
-                    nom = a["function"]["name"]
-                    try:
-                        args = json.loads(a["function"].get("arguments") or "{}")
-                        fn = OUTILS_PAR_NOM[nom]
-                        resultat = str(fn(**args))
-                    except Exception as e:
-                        resultat = f"Erreur : {e}"
-                    self.messages.append({"role": "tool", "tool_call_id": a["id"],
-                                          "content": resultat[:2000]})
-            self.messages.append({"role": "assistant", "content": "J'ai fait ce que j'ai pu."})
-            return Reponse("J'ai fait ce que j'ai pu.")
-        except Exception:
-            del self.messages[debut:]             # annule l'échange raté pour ne pas casser l'historique
-            raise
+    def send_message(self, texte, historique):
+        messages = [{"role": "system", "content": _consigne()}]
+        for u, a in historique:
+            messages += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
+        messages.append({"role": "user", "content": texte})
+        for _ in range(MAX_ETAPES):
+            msg = self._requete(messages)["choices"][0]["message"]
+            appels = msg.get("tool_calls")
+            if not appels:
+                return Reponse((msg.get("content") or "").strip() or "C'est fait.")
+            messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": appels})
+            for a in appels:
+                nom = a["function"]["name"]
+                try:
+                    args = json.loads(a["function"].get("arguments") or "{}")
+                    resultat = str(OUTILS_PAR_NOM[nom](**args))
+                except KeyError:
+                    resultat = f"Erreur : l'outil {nom} n'existe pas."
+                except Exception as e:
+                    resultat = f"Erreur : {e}"
+                messages.append({"role": "tool", "tool_call_id": a["id"], "content": resultat[:6000]})
+        return Reponse("J'ai fait beaucoup d'étapes, dis-moi si je dois continuer.")
+
+
+def _classer_erreur(e):
+    """Renvoie (raison lisible, pause en secondes avant de réessayer ce modèle)."""
+    s = str(e)
+    b = s.lower().replace(" ", "")
+    code = getattr(e, "code", 0) or 0
+    if "429" in s or "RESOURCE_EXHAUSTED" in s or code == 429 or "ratelimit" in b:
+        if "perday" in b or "tokensperday" in b or "(tpd)" in b or "(rpd)" in b:
+            return "quota du jour épuisé", 3 * 3600
+        attente = getattr(e, "attente", None)
+        m = re.search(r"(?:retry|try again) in ([\d.]+)s|retryDelay['\": ]+(\d+)", s)
+        if m:
+            attente = float(m.group(1) or m.group(2))
+        return "limite par minute", max(20, min(300, attente or 60))
+    if "404" in s or "NOT_FOUND" in s or "model_not_found" in s or "decommissioned" in s or code == 404:
+        return "modèle introuvable", 24 * 3600
+    if any(k in s for k in ("401", "403", "PERMISSION_DENIED", "UNAUTHENTICATED", "API key")) or code in (401, 403):
+        return "clé refusée", 24 * 3600
+    if code == 413 or "413" in s:
+        return "demande trop grosse pour ce modèle", 30
+    if "504" in s or "DEADLINE" in s or "Timeout" in type(e).__name__ or "timed out" in s.lower():
+        return "trop lent", 300           # un modèle qui traîne : on l'évite 5 min pour répondre vite
+    if any(k in s for k in ("500", "502", "503", "UNAVAILABLE", "overloaded", "INTERNAL")) or code >= 500:
+        return "serveur saturé", 120
+    if "Connection" in type(e).__name__:
+        return "réseau", 15
+    return f"erreur {type(e).__name__}", 20
 
 
 class Cerveau:
-    """Gemini en priorité ; si son quota est atteint (ou s'il est saturé), bascule sur Groq."""
+    """Essaie les modèles dans l'ordre : chaque Gemini (quotas séparés), puis chaque Groq.
+    Un modèle en erreur est mis en pause (1 min pour une limite par minute, 3 h pour le quota du jour...)
+    et le suivant prend le relais AVEC tout l'historique. Si des actions ont déjà été faites avant la
+    panne, le modèle suivant est prévenu pour ne pas les refaire."""
 
     def __init__(self):
-        self.gemini = Discussion()
-        self.groq = GroqChat()
-        self.pause_gemini_jusqua = 0.0
-        if self.groq.disponible():
-            print("Groq : clé trouvée, bascule automatique activée.")
-        else:
-            print("Groq : pas de clé GROQ_API_KEY, pas de cerveau de secours.")
+        self.historique = []
+        self.cerveaux = [Discussion(m) for m in MODELES_GEMINI if _lire_cle("GEMINI_API_KEY")]
+        groq = [GroqChat(m) for m in MODELES_GROQ]
+        self.cerveaux += [g for g in groq if g.disponible()]
+        self.pause = {}
+        print(f"Cerveaux disponibles (dans l'ordre) : {', '.join(c.modele for c in self.cerveaux)}")
+        if not any(isinstance(c, GroqChat) for c in self.cerveaux):
+            print("Groq : pas de clé GROQ_API_KEY, pas de cerveau de secours Groq.")
+        self.actuel = None
+
+    def _noter(self, texte, reponse, actions):
+        if actions:
+            reponse += "\n[Actions faites : " + " ; ".join(actions[-12:]) + "]"
+        self.historique.append((texte, reponse))
+        self.historique = self.historique[-HISTORIQUE_ECHANGES:]
 
     def send_message(self, texte):
-        if time.time() >= self.pause_gemini_jusqua or not self.groq.disponible():
+        _JOURNAL.clear()
+        message = f"[Dossier de travail : {_CWD['d']}]\n{texte}"
+        derniere = None
+        maintenant = time.time()
+        ordre = [c for c in self.cerveaux if self.pause.get(c.modele, 0) <= maintenant]
+        if not ordre:                     # tout est en pause : on retente quand même le plus proche
+            ordre = sorted(self.cerveaux, key=lambda c: self.pause.get(c.modele, 0))
+        essais = [(c, n) for c in ordre for n in (0, 1)]
+        for c, n in essais:
+            if n == 1 and not (derniere is not None and getattr(derniere, "_modele", None) == c.modele
+                               and _classer_erreur(derniere)[0] == "serveur saturé"):
+                continue                  # 2e essai du même modèle seulement s'il était juste saturé (503)
+            if n == 1:
+                time.sleep(2)
+            deja = list(_JOURNAL)
+            envoi = message
+            if deja:
+                envoi = (message + "\n\n(Attention : cette demande a déjà été commencée, ces actions sont FAITES : "
+                         + " ; ".join(deja) + ". NE LES REFAIS PAS, termine seulement ce qui manque.)")
             try:
-                rep = self.gemini.send_message(texte)
-                self.groq.noter(texte, rep.text)
+                rep = c.send_message(envoi, self.historique)
+                if self.actuel != c.modele:
+                    if self.actuel:
+                        print(f"   (cerveau utilisé : {c.modele})")
+                    self.actuel = c.modele
+                self._noter(texte, rep.text, list(_JOURNAL))
                 return rep
             except Exception as e:
-                s = str(e)
-                sature = any(k in s for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "overloaded"))
-                if not (sature and self.groq.disponible()):
-                    raise
-                par_jour = "perday" in s.lower().replace(" ", "")
-                self.pause_gemini_jusqua = time.time() + (3600 if par_jour else 90)
-                print(f"[Gemini saturé ({'quota du jour' if par_jour else 'limite par minute'}) : "
-                      f"je passe sur Groq]")
-        return self.groq.send_message(texte)
+                raison, pause = _classer_erreur(e)
+                derniere = e
+                try:
+                    e._modele = c.modele
+                except Exception:
+                    pass
+                if n == 0 and raison == "serveur saturé":
+                    print(f"[{c.modele} : saturé, je réessaie dans 2 s]")
+                    continue
+                self.pause[c.modele] = time.time() + pause
+                print(f"[{c.modele} : {raison} -> pause {int(pause)} s, je passe au suivant] {str(e)[:150]}")
+        raise derniere or Indisponible("aucun cerveau configuré")
 
 
 def creer_chat():
-    return _client(), Cerveau()
+    return None, Cerveau()
+
+
+_ACTIONS_DITES = {
+    "ouvrir_terminal": "ouvert le terminal", "taper_dans_terminal": "lancé la commande dans le terminal",
+    "executer_commande": "exécuté la commande", "lancer_en_arriere_plan": "lancé le programme",
+    "ouvrir_application": "ouvert l'application", "ouvrir_dans_editeur": "ouvert ça dans l'éditeur",
+    "ouvrir_url": "ouvert la page", "chercher_sur_internet": "lancé la recherche",
+    "creer_dossier": "créé le dossier", "changer_dossier": "changé de dossier",
+    "ecrire_fichier": "écrit le fichier", "modifier_fichier": "modifié le fichier",
+    "verifier_code": "vérifié le code", "regler_volume": "réglé le volume",
+}
+
+
+def _confirmation(actions):
+    """Phrase parlée qui résume ce qui a été fait (quand le cerveau n'a rien dit de précis)."""
+    faits = []
+    for a in actions:
+        dit = _ACTIONS_DITES.get(a.split("(", 1)[0])
+        if dit and dit not in faits:
+            faits.append(dit)
+    if not faits:
+        return "C'est fait."
+    if len(faits) > 1:
+        faits[-1] = "et " + faits[-1]
+    return "C'est fait, j'ai " + (", ".join(faits[:-1]) + " " + faits[-1] if len(faits) > 1 else faits[0]) + "."
 
 
 def demander_ia(client, chat, texte):
     """Interroge le cerveau et traduit les erreurs en phrases claires."""
-    erreur = None
-    for essai in range(2):
-        try:
-            return chat.send_message(texte).text or "C'est fait."
-        except Exception as e:
-            erreur = e
-            if any(k in str(e) for k in ("500", "502", "503", "UNAVAILABLE", "overloaded")) and essai == 0:
-                time.sleep(1.5)
-                continue
-            break
-    s = str(erreur)
-    print(f"[Erreur IA : {type(erreur).__name__}: {s[:300]}]")
-    if "429" in s or "RESOURCE_EXHAUSTED" in s:
-        return "J'ai atteint la limite gratuite. Réessaie dans une minute."
-    if "404" in s or "NOT_FOUND" in s:
-        return "Le nom du modèle dans mon fichier n'est pas valide."
-    if any(k in s for k in ("API key", "401", "403", "PERMISSION_DENIED", "UNAUTHENTICATED")):
-        return "Ma clé API est refusée."
-    return "Désolé, je n'arrive pas à joindre mon cerveau pour le moment."
+    try:
+        rep = re.sub(r"\[Actions faites[^\]]*\]", "", chat.send_message(texte).text or "").strip()
+        if not rep or rep.lower().strip(" .!") in ("c'est fait", "fait", "ok", "voilà"):
+            rep = _confirmation(_JOURNAL)          # il dit toujours ce qu'il a fait
+        return rep
+    except Exception as erreur:
+        s = str(erreur)
+        print(f"[Erreur IA : {type(erreur).__name__}: {s[:300]}]")
+        raison = _classer_erreur(erreur)[0]
+        if "quota" in raison or "limite" in raison:
+            return "Tous mes cerveaux ont atteint leur limite gratuite. Réessaie dans une minute."
+        if "clé" in raison:
+            return "Mes clés API sont refusées."
+        if "introuvable" in raison:
+            return "Les noms de modèles dans mon fichier ne sont pas valides."
+        return "Désolé, je n'arrive pas à joindre mon cerveau pour le moment."
 
 
 def traiter(commande, client, chat):
@@ -1051,17 +1660,24 @@ def test_cle():
 
 
 def test_groq():
-    g = GroqChat()
-    if not g.disponible():
+    if not _lire_cle("GROQ_API_KEY"):
         print("GROQ_API_KEY n'est pas définie.")
         return
-    t0 = time.time()
-    try:
-        print("Groq répond :", g.send_message("Dis bonjour en une phrase.").text)
-        print("Test des outils :", g.send_message("Quelle heure est-il ?").text)
-        print(f"Modèle utilisé : {g.modele_ok} | Temps : {time.time() - t0:.1f}s")
-    except Exception as e:
-        print(f"Erreur : {type(e).__name__}: {e}")
+    for modele in MODELES_GROQ:
+        g = GroqChat(modele)
+        t0 = time.time()
+        try:
+            print(f"{modele} répond :", g.send_message("Dis bonjour en une phrase.", []).text)
+            print("   test des outils :", g.send_message("Quelle heure est-il ?", []).text,
+                  f"({time.time() - t0:.1f}s)")
+        except Exception as e:
+            print(f"{modele} : erreur {type(e).__name__}: {str(e)[:200]}")
+
+
+def test_terminal():
+    print(ouvrir_terminal())
+    print(taper_dans_terminal("echo Bonjour depuis Jarvis && ls | head -5", 10))
+    print(taper_dans_terminal("cd /tmp", 5), "| cd conservé ->", _CWD["d"])
 
 
 def test_voix():
@@ -1081,6 +1697,8 @@ def test_micro():
 def test_outils():
     print("Date :", date_et_heure())
     print("Commande :", executer_commande("echo salut && uname -r"))
+    print("cd conservé :", executer_commande("cd /tmp"), "->", executer_commande("pwd"))
+    print("Éditeur :", contexte_editeur())
     for app in ("firefox", "calculatrice", "terminal"):
         print(f"Application « {app} » ->", _trouver_application(app) or "introuvable")
 
@@ -1241,6 +1859,8 @@ def main():
                         continue
             elif en_conversation:
                 commande = ("(Tu viens d'être coupé en pleine phrase : abandonne ce que tu disais.) " + t) if coupe else t
+            elif not MOT_ACTIVATION_OBLIGATOIRE and _DERNIER.get("sur"):
+                commande = t                           # c'est clairement ta voix : pas besoin de « Jarvis »
             else:
                 print(f"   (ignoré : dis d'abord « {NOMS[0]} »)")
                 continue
@@ -1250,7 +1870,7 @@ def main():
 
 
 if __name__ == "__main__":
-    modes = {"test-cle": test_cle, "test-groq": test_groq, "test-voix": test_voix,
+    modes = {"test-cle": test_cle, "test-groq": test_groq, "test-terminal": test_terminal, "test-voix": test_voix,
              "test-micro": test_micro, "test-outils": test_outils,
              "apprendre-voix": apprendre_voix, "test-id": test_id}
     try:
