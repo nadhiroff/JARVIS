@@ -89,7 +89,7 @@ INTERRUPTION = True                       # True = tu peux couper Jarvis en parl
 SEUIL_INTERRUPTION = 0.55                 # idem pour couper Jarvis (plus bas : sa voix se mélange à la tienne)
 FACTEUR_INTERRUPTION = 0.8                # volume minimal avant de tenter de te reconnaître pendant qu'il parle
 DEBUG_INTERRUPTION = True                 # True = affiche la ressemblance pendant qu'il parle (pour régler). Mets False quand c'est bon
-UN_INSTANT_APRES = 3.0                    # dit « Un instant. » seulement si la réponse met plus de N secondes (None = jamais)
+UN_INSTANT_APRES = None                   # N = dit « Un instant. » si la réponse met plus de N secondes (None = jamais)
 VOIX_FICHIER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voix_nadhir.npy")
 # Phrases qui terminent la discussion (ensuite il faut redire "Jarvis")
 FIN_CONVERSATION = re.compile(r"^(ok |d'accord |bon )?(merci|c'est bon|c'est tout|ça sera tout|ça suffit)( beaucoup| jarvis)*[ .!]*$")
