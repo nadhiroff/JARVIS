@@ -61,7 +61,7 @@ MODELES_GEMINI = ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "g
                   "gemini-3.1-flash-lite")
 MODELES_GROQ = ("openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b")
 REFLEXION = "low"                         # réflexion de Gemini 3 : "low" (rapide ; "minimal" est refusé par gemini-3.8-flash)
-DELAI_CERVEAU = 60                        # secondes max d'attente d'un cerveau avant de passer au suivant
+DELAI_CERVEAU = 30                        # secondes max d'attente d'un cerveau avant de passer au suivant
 MOT_ACTIVATION_OBLIGATOIRE = False        # False = si c'est clairement TA voix, pas besoin de dire « Jarvis »
 MAX_ETAPES = 30                           # nombre max d'outils enchaînés pour UNE demande (ouvrir, créer, écrire, vérifier...)
 HISTORIQUE_ECHANGES = 12                  # nombre d'échanges gardés en mémoire (partagés entre Gemini et Groq)
@@ -74,8 +74,8 @@ DELAI_COMMANDE = 120                      # secondes max pour une commande
 # Écoute
 CONVERSATION_SECONDES = 45                # après une réponse, tu peux continuer SANS redire "Jarvis" (0 = toujours dire Jarvis)
 FACTEUR_SEUIL = 1.2                       # >1 = ignore mieux les voix faibles/lointaines. Trop haut : il ne t'entend plus (essaie 1.2)
-PAUSE_FIN_PHRASE = 1.6                    # secondes de silence avant de considérer que tu as fini (avant : 1.0, trop court)
-ATTENTE_SUITE = 0.8                       # après ce silence, il écoute encore un peu si tu reprends la parole
+PAUSE_FIN_PHRASE = 1.2                    # secondes de silence avant de considérer que tu as fini (+ bas = répond plus vite)
+ATTENTE_SUITE = 0.5                       # après ce silence, il écoute encore un peu si tu reprends la parole
 ATTENTE_SUITE_LONGUE = 3.0                # ... et plus longtemps si ta phrase finit par « et », « puis », « de »...
 DUREE_MAX_PHRASE = 90                     # durée max d'une demande en secondes (avant : 15 s, il te coupait)
 
@@ -210,7 +210,8 @@ def _synth_gemini(texte):
             break
     limite = "429" in str(erreur) or "RESOURCE_EXHAUSTED" in str(erreur)
     print(f"[Voix Gemini {'(quota atteint)' if limite else 'indisponible'} : {type(erreur).__name__}]")
-    _gemini_pause_jusqua = time.time() + (600 if limite else 60)   # en attendant : voix Piper, instantanée
+    par_jour = "perday" in str(erreur).lower().replace(" ", "")
+    _gemini_pause_jusqua = time.time() + (3 * 3600 if par_jour else 600 if limite else 60)   # en attendant : voix Piper, instantanée
     return None
 
 
@@ -1690,7 +1691,7 @@ class GroqChat:
             except ValueError:
                 m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", r.text)
                 attente = (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else None
-            if r.status_code == 429 and attente is not None and attente <= 20 and essai < 2:
+            if r.status_code == 429 and attente is not None and attente <= 3 and essai < 2:
                 print(f"   (Groq demande d'attendre {attente:.0f} s : j'attends)")
                 time.sleep(attente + 0.5)     # limite par minute : on patiente au lieu d'abandonner
                 continue
@@ -1763,11 +1764,34 @@ class Cerveau:
         self.cerveaux = [Discussion(m) for m in MODELES_GEMINI if _lire_cle("GEMINI_API_KEY")]
         groq = [GroqChat(m) for m in MODELES_GROQ]
         self.cerveaux += [g for g in groq if g.disponible()]
-        self.pause = {}
+        self.pause = self._charger_pauses()
         print(f"Cerveaux disponibles (dans l'ordre) : {', '.join(c.modele for c in self.cerveaux)}")
         if not any(isinstance(c, GroqChat) for c in self.cerveaux):
             print("Groq : pas de clé GROQ_API_KEY, pas de cerveau de secours Groq.")
         self.actuel = None
+
+    _FICHIER_PAUSES = os.path.expanduser("~/.cache/jarvis_pauses.json")
+
+    def _charger_pauses(self):
+        """Les modèles épuisés restent en pause même après un redémarrage (plus d'essais inutiles)."""
+        try:
+            with open(self._FICHIER_PAUSES) as f:
+                pauses = {k: v for k, v in json.load(f).items() if v > time.time()}
+            if pauses:
+                print("Modèles encore en pause : " + ", ".join(
+                    f"{k} ({int((v - time.time()) / 60)} min)" for k, v in pauses.items()))
+            return pauses
+        except Exception:
+            return {}
+
+    def _mettre_en_pause(self, modele, secondes):
+        self.pause[modele] = time.time() + secondes
+        try:
+            os.makedirs(os.path.dirname(self._FICHIER_PAUSES), exist_ok=True)
+            with open(self._FICHIER_PAUSES, "w") as f:
+                json.dump(self.pause, f)
+        except Exception:
+            pass
 
     def _noter(self, texte, reponse, actions):
         if actions:
@@ -1775,8 +1799,9 @@ class Cerveau:
         self.historique.append((texte, reponse))
         self.historique = self.historique[-HISTORIQUE_ECHANGES:]
 
-    def send_message(self, texte):
-        _JOURNAL.clear()
+    def send_message(self, texte, _attendu=False):
+        if not _attendu:
+            _JOURNAL.clear()
         message = f"[Dossier de travail : {_CWD['d']}]\n{texte}"
         derniere = None
         maintenant = time.time()
@@ -1796,7 +1821,12 @@ class Cerveau:
                 envoi = (message + "\n\n(Attention : cette demande a déjà été commencée, ces actions sont FAITES : "
                          + " ; ".join(deja) + ". NE LES REFAIS PAS, termine seulement ce qui manque.)")
             try:
+                t0 = time.time()
                 rep = c.send_message(envoi, self.historique)
+                duree = time.time() - t0
+                if duree > 12 and not _JOURNAL:      # question simple mais modèle surchargé : on l'évite 10 min
+                    print(f"   ({c.modele} a été lent ({duree:.0f} s) : je l'évite pendant 10 min)")
+                    self._mettre_en_pause(c.modele, 600)
                 if self.actuel != c.modele:
                     if self.actuel:
                         print(f"   (cerveau utilisé : {c.modele})")
@@ -1813,8 +1843,14 @@ class Cerveau:
                 if n == 0 and raison == "serveur saturé":
                     print(f"[{c.modele} : saturé, je réessaie dans 2 s]")
                     continue
-                self.pause[c.modele] = time.time() + pause
+                self._mettre_en_pause(c.modele, pause)
                 print(f"[{c.modele} : {raison} -> pause {int(pause)} s, je passe au suivant] {str(e)[:150]}")
+        # tout le monde est en pause pour quelques secondes (limite par minute) : on patiente un peu
+        prochain = min((self.pause.get(c.modele, 0) for c in self.cerveaux), default=0) - time.time()
+        if not _attendu and 0 < prochain <= 25:
+            print(f"   (tous mes cerveaux sont limités : j'attends {prochain:.0f} s)")
+            time.sleep(prochain + 0.5)
+            return self.send_message(texte, _attendu=True)
         raise derniere or Indisponible("aucun cerveau configuré")
 
 
@@ -2069,6 +2105,11 @@ def main():
         _MIC["r"], _MIC["source"] = r, source
         if UN_INSTANT_APRES is not None:
             preparer_ack()
+        def _prechauffer():                      # charge la voix de secours Piper (3 s la 1re fois)
+            w = _synth_piper("Prêt.")
+            if w and os.path.exists(w):
+                os.remove(w)
+        threading.Thread(target=_prechauffer, daemon=True).start()
         parler(f"Bonjour {PRENOM}, Jarvis en ligne. Je t'écoute.")
         print(f"(Commence par « {NOMS[0]} ». Ensuite tu peux enchaîner pendant {CONVERSATION_SECONDES} s "
               "sans redire mon nom, et me couper quand je parle. Dis « merci » pour finir la discussion. "
